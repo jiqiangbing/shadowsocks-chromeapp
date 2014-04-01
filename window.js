@@ -2,7 +2,7 @@
 (function() {
   'use strict';
 
-  require('./node_modules/shadowsocks/lib/local').main();
+  require('./node_modules/shadowsocks/lib/shadowsocks/local').main();
 
 
   var load, restartServer, saveChanges;

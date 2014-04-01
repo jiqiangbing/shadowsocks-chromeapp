@@ -7,8 +7,6 @@ var require = function (file, cwd) {
         );}
     var cached = require.cache[resolved];
     var res = cached? cached.exports : mod();
-    console.info(file);
-    console.info(res);
     return res;
 };
 
