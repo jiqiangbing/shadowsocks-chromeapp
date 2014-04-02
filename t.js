@@ -1,6 +1,2590 @@
 (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+(function (process,Buffer){
+/**
+ * net
+ * ===
+ *
+ * The net module provides you with an asynchronous network wrapper. It
+ * contains methods for creating both servers and clients (called streams).
+ * You can include this module with require('chrome-net')
+ */
 
-},{}],2:[function(require,module,exports){
+var EventEmitter = require('events').EventEmitter
+var inherits = require('inherits')
+var ipaddr = require('ipaddr.js')
+var is = require('core-util-is')
+var stream = require('stream')
+
+// Track open servers and sockets to route incoming sockets (via onAccept and onReceive)
+// to the right handlers.
+var servers = {}
+var sockets = {}
+
+if (typeof chrome !== 'undefined') {
+  chrome.sockets.tcpServer.onAccept.addListener(onAccept)
+  chrome.sockets.tcpServer.onAcceptError.addListener(onAcceptError)
+  chrome.sockets.tcp.onReceive.addListener(onReceive)
+  chrome.sockets.tcp.onReceiveError.addListener(onReceiveError)
+}
+
+function onAccept (info) {
+  if (info.socketId in servers) {
+    servers[info.socketId]._onAccept(info.clientSocketId)
+  } else {
+    console.error('Unknown server socket id: ' + info.socketId)
+  }
+}
+
+function onAcceptError (info) {
+  if (info.socketId in servers) {
+    servers[info.socketId]._onAcceptError(info.resultCode)
+  } else {
+    console.error('Unknown server socket id: ' + info.socketId)
+  }
+}
+
+function onReceive (info) {
+  if (info.socketId in sockets) {
+    sockets[info.socketId]._onReceive(info.data)
+  } else {
+    console.error('Unknown socket id: ' + info.socketId)
+  }
+}
+
+function onReceiveError (info) {
+  if (info.socketId in sockets) {
+    sockets[info.socketId]._onReceiveError(info.resultCode)
+  } else {
+    console.error('Unknown socket id: ' + info.socketId)
+  }
+}
+
+/**
+ * Creates a new TCP server. The connectionListener argument is automatically
+ * set as a listener for the 'connection' event.
+ *
+ * @param  {Object} options
+ * @param  {function} listener
+ * @return {Server}
+ */
+exports.createServer = function (options, listener) {
+  return new Server(arguments[0], arguments[1])
+}
+
+/**
+ * net.connect(options, [connectionListener])
+ * net.createConnection(options, [connectionListener])
+ *
+ * Constructs a new socket object and opens the socket to the given location.
+ * When the socket is established, the 'connect' event will be emitted.
+ *
+ * For TCP sockets, options argument should be an object which specifies:
+ *
+ *   port: Port the client should connect to (Required).
+ *   host: Host the client should connect to. Defaults to 'localhost'.
+ *   localAddress: Local interface to bind to for network connections.
+ *
+ * ===============================================================
+ *
+ * net.connect(port, [host], [connectListener])
+ * net.createConnection(port, [host], [connectListener])
+ *
+ * Creates a TCP connection to port on host. If host is omitted,
+ * 'localhost' will be assumed. The connectListener parameter will be
+ * added as an listener for the 'connect' event.
+ *
+ * @param {Object} options
+ * @param {function} listener
+ * @return {Socket}
+ */
+exports.connect = exports.createConnection = function () {
+  var args = normalizeConnectArgs(arguments)
+  var s = new Socket(args[0])
+  return Socket.prototype.connect.apply(s, args)
+}
+
+inherits(Server, EventEmitter)
+
+/**
+ * Class: net.Server
+ * =================
+ *
+ * This class is used to create a TCP server.
+ *
+ * Event: 'listening'
+ *   Emitted when the server has been bound after calling server.listen.
+ *
+ * Event: 'connection'
+ *   - Socket object The connection object
+ *   Emitted when a new connection is made. socket is an instance of net.Socket.
+ *
+ * Event: 'close'
+ *   Emitted when the server closes. Note that if connections exist, this event
+ *   is not emitted until all connections are ended.
+ *
+ * Event: 'error'
+ *   - Error Object
+ *   Emitted when an error occurs. The 'close' event will be called directly
+ *   following this event. See example in discussion of server.listen.
+ */
+function Server (/* [options], listener */) {
+  var self = this
+  if (!(self instanceof Server)) return new Server(arguments[0], arguments[1])
+  EventEmitter.call(self)
+
+  var options
+
+  if (is.isFunction(arguments[0])) {
+    options = {}
+    self.on('connection', arguments[0])
+  } else {
+    options = arguments[0] || {}
+
+    if (is.isFunction(arguments[1])) {
+      self.on('connection', arguments[1])
+    }
+  }
+
+  self._destroyed = false
+  self._connections = 0
+}
+exports.Server = Server
+
+/**
+ * server.listen(port, [host], [backlog], [callback])
+ *
+ * Begin accepting connections on the specified port and host. If the host is
+ * omitted, the server will accept connections directed to any IPv4 address
+ * (INADDR_ANY). A port value of zero will assign a random port.
+ *
+ * Backlog is the maximum length of the queue of pending connections. The
+ * actual length will be determined by your OS through sysctl settings such as
+ * tcp_max_syn_backlog and somaxconn on linux. The default value of this
+ * parameter is 511 (not 512).
+ *
+ * This function is asynchronous. When the server has been bound, 'listening'
+ * event will be emitted. The last parameter callback will be added as an
+ * listener for the 'listening' event.
+ *
+ * @return {Socket}
+ */
+Server.prototype.listen = function (/* variable arguments... */) {
+  var self = this
+
+  var lastArg = arguments[arguments.length - 1]
+  if (is.isFunction(lastArg)) {
+    self.once('listening', lastArg)
+  }
+
+  // If port is invalid or undefined, bind to a random port.
+  var port = toNumber(arguments[0]) || 0
+
+  var address
+  if (arguments[1] == null ||
+      is.isFunction(arguments[1]) ||
+      is.isNumber(arguments[1])) {
+    // The first argument is the port, no IP given.
+    address = '0.0.0.0'
+  } else {
+    address = arguments[1]
+  }
+
+  // The third optional argument is the backlog size.
+  // When the ip is omitted it can be the second argument.
+  var backlog = toNumber(arguments[1]) || toNumber(arguments[2]) || undefined
+
+  chrome.sockets.tcpServer.create(function (createInfo) {
+    self.id = createInfo.socketId
+
+    chrome.sockets.tcpServer.listen(self.id, address, port, backlog, function (result) {
+      if (result < 0) {
+        self.emit('error', new Error('Socket ' + self.id + ' failed to listen. ' +
+          chrome.runtime.lastError.message))
+        self._destroy()
+        return
+      }
+
+      self._address = address
+      self._port = port
+
+      servers[self.id] = self
+      self.emit('listening')
+    })
+  })
+
+  return self
+}
+
+Server.prototype._onAccept = function (clientSocketId) {
+  var self = this
+
+  // Set the `maxConnections` property to reject connections when the server's
+  // connection count gets high.
+  if (self.maxConnections && self._connections >= self.maxConnections) {
+    chrome.sockets.tcpServer.disconnect(clientSocketId)
+    chrome.sockets.tcpServer.close(clientSocketId)
+    console.warn('Rejected connection - hit `maxConnections` limit')
+    return
+  }
+
+  self._connections += 1
+
+  var acceptedSocket = new Socket({
+    server: self,
+    id: clientSocketId
+  })
+  acceptedSocket.on('connect', function () {
+    self.emit('connection', acceptedSocket)
+  })
+
+  chrome.sockets.tcp.setPaused(clientSocketId, false)
+}
+
+Server.prototype._onAcceptError = function (resultCode) {
+  var self = this
+  self.emit('error', new Error('Socket ' + self.id + ' failed to accept (' +
+    resultCode + ')'))
+  self._destroy()
+}
+
+/**
+ * Stops the server from accepting new connections and keeps existing
+ * connections. This function is asynchronous, the server is finally closed
+ * when all connections are ended and the server emits a 'close' event.
+ * Optionally, you can pass a callback to listen for the 'close' event.
+ * @param  {function} callback
+ */
+Server.prototype.close = function (callback) {
+  var self = this
+  self._destroy(callback)
+}
+
+Server.prototype._destroy = function (exception, cb) {
+  var self = this
+
+  if (self._destroyed)
+    return
+
+  if (cb)
+    this.once('close', cb)
+
+  this._destroyed = true
+  this._connections = 0
+  delete servers[self.id]
+
+  chrome.sockets.tcpServer.disconnect(self.id, function () {
+    chrome.sockets.tcpServer.close(self.id, function () {
+      self.emit('close')
+    })
+  })
+}
+
+/**
+ * Returns the bound address, the address family name and port of the socket
+ * as reported by the operating system. Returns an object with three
+ * properties, e.g. { port: 12346, family: 'IPv4', address: '127.0.0.1' }
+ *
+ * @return {Object} information
+ */
+Server.prototype.address = function () {
+  var self = this
+  return {
+    address: self._address,
+    port: self._port,
+    family: 'IPv4'
+  }
+}
+
+Server.prototype.unref = function () {
+  // No chrome.socket equivalent
+}
+
+Server.prototype.ref = function () {
+  // No chrome.socket equivalent
+}
+
+/**
+ * Asynchronously get the number of concurrent connections on the server.
+ * Works when sockets were sent to forks.
+ *
+ * Callback should take two arguments err and count.
+ *
+ * @param  {function} callback
+ */
+Server.prototype.getConnections = function (callback) {
+  var self = this
+  process.nextTick(function () {
+    callback(null, self._connections)
+  })
+}
+
+
+inherits(Socket, stream.Duplex)
+
+/**
+ * Class: net.Socket
+ * =================
+ *
+ * This object is an abstraction of a TCP or UNIX socket. net.Socket instances
+ * implement a duplex Stream interface. They can be created by the user and
+ * used as a client (with connect()) or they can be created by Node and passed
+ * to the user through the 'connection' event of a server.
+ *
+ * Construct a new socket object.
+ *
+ * options is an object with the following defaults:
+ *
+ *   { fd: null // NO CHROME EQUIVALENT
+ *     type: null
+ *     allowHalfOpen: false // NO CHROME EQUIVALENT
+ *   }
+ *
+ * `type` can only be 'tcp4' (for now).
+ *
+ * Event: 'connect'
+ *   Emitted when a socket connection is successfully established. See
+ *   connect().
+ *
+ * Event: 'data'
+ *   - Buffer object
+ *   Emitted when data is received. The argument data will be a Buffer or
+ *   String. Encoding of data is set by socket.setEncoding(). (See the Readable
+ *   Stream section for more information.)
+ *
+ *   Note that the data will be lost if there is no listener when a Socket
+ *   emits a 'data' event.
+ *
+ * Event: 'end'
+ *   Emitted when the other end of the socket sends a FIN packet.
+ *
+ *   By default (allowHalfOpen == false) the socket will destroy its file
+ *   descriptor once it has written out its pending write queue. However,
+ *   by setting allowHalfOpen == true the socket will not automatically
+ *   end() its side allowing the user to write arbitrary amounts of data,
+ *   with the caveat that the user is required to end() their side now.
+ *
+ * Event: 'timeout'
+ *   Emitted if the socket times out from inactivity. This is only to notify
+ *   that the socket has been idle. The user must manually close the connection.
+ *
+ *   See also: socket.setTimeout()
+ *
+ * Event: 'drain'
+ *   Emitted when the write buffer becomes empty. Can be used to throttle
+ *   uploads.
+ *
+ *   See also: the return values of socket.write()
+ *
+ * Event: 'error'
+ *   - Error object
+ *   Emitted when an error occurs. The 'close' event will be called directly
+ *   following this event.
+ *
+ * Event: 'close'
+ *   - had_error Boolean true if the socket had a transmission error
+ *   Emitted once the socket is fully closed. The argument had_error is a
+ *   boolean which says if the socket was closed due to a transmission error.
+ */
+function Socket (options) {
+  var self = this
+  if (!(self instanceof Socket)) return new Socket(options)
+
+  if (is.isUndefined(options))
+    options = {}
+
+  stream.Duplex.call(self, options)
+
+  self.destroyed = false
+  self.errorEmitted = false
+  self.readable = self.writable = false
+
+  // The amount of received bytes.
+  self.bytesRead = 0
+
+  self._bytesDispatched = 0
+  self._connecting = false
+
+  if (options.server) {
+    self.server = options.server
+    self.id = options.id
+
+    // For incoming sockets (from server), it's already connected.
+    self._connecting = true
+    self._onConnect()
+  }
+}
+
+/**
+ * socket.connect(port, [host], [connectListener])
+ * socket.connect(options, [connectListener])
+ *
+ * Opens the connection for a given socket. If port and host are given, then
+ * the socket will be opened as a TCP socket, if host is omitted, localhost
+ * will be assumed. If a path is given, the socket will be opened as a unix
+ * socket to that path.
+ *
+ * Normally this method is not needed, as net.createConnection opens the
+ * socket. Use this only if you are implementing a custom Socket.
+ *
+ * This function is asynchronous. When the 'connect' event is emitted the
+ * socket is established. If there is a problem connecting, the 'connect'
+ * event will not be emitted, the 'error' event will be emitted with the
+ * exception.
+ *
+ * The connectListener parameter will be added as an listener for the
+ * 'connect' event.
+ *
+ * @param  {Object} options
+ * @param  {function} [connectListener]
+ * @return {Socket}   this socket (for chaining)
+ */
+Socket.prototype.connect = function (options, cb) {
+  var self = this
+
+  if (self._connecting)
+    return
+  self._connecting = true
+
+  var port = Number(options.port)
+
+  if (is.isFunction(cb)) {
+    self.once('connect', cb)
+  }
+
+  chrome.sockets.tcp.create(function (createInfo) {
+    self.id = createInfo.socketId
+
+    chrome.sockets.tcp.connect(self.id, options.host, port, function (result) {
+      if (result < 0) {
+        self.destroy(new Error('Socket ' + self.id + ' connect error ' + result))
+        return
+      }
+
+      self._onConnect()
+    })
+  })
+
+  return self
+}
+
+Socket.prototype._onConnect = function () {
+  var self = this
+
+  sockets[self.id] = self
+  chrome.sockets.tcp.getInfo(self.id, function (result) {
+    self.remoteAddress = result.peerAddress
+    self.remotePort = result.peerPort
+    self.localAddress = result.localAddress
+    self.localPort = result.localPort
+
+    self._connecting = false
+    self.readable = self.writable = true
+
+    self.emit('connect')
+    // start the first read, or get an immediate EOF.
+    // this doesn't actually consume any bytes, because len=0
+    self.read(0)
+  })
+}
+
+/**
+ * The number of characters currently buffered to be written.
+ * @type {number}
+ */
+Object.defineProperty(Socket.prototype, 'bufferSize', {
+  get: function () {
+    var self = this
+    if (self._pendingData)
+      return self._pendingData.length
+    else
+      return 0 // Unfortunately, chrome.socket does not make this info available
+  }
+})
+
+/**
+ * Sends data on the socket. The second parameter specifies the encoding in
+ * the case of a string--it defaults to UTF8 encoding.
+ *
+ * Returns true if the entire data was flushed successfully to the kernel
+ * buffer. Returns false if all or part of the data was queued in user memory.
+ * 'drain' will be emitted when the buffer is again free.
+ *
+ * The optional callback parameter will be executed when the data is finally
+ * written out - this may not be immediately.
+ *
+ * @param  {Buffer|Arrayish|string} chunk
+ * @param  {string} [encoding]
+ * @param  {function} [callback]
+ * @return {boolean}             flushed to kernel completely?
+ */
+Socket.prototype.write = function (chunk, encoding, callback) {
+  var self = this
+  if (!Buffer.isBuffer(chunk))
+    chunk = new Buffer(chunk, encoding)
+
+  return stream.Duplex.prototype.write.call(self, chunk, encoding, callback)
+}
+
+Socket.prototype._write = function (buffer, encoding, callback) {
+  var self = this
+  if (!callback) callback = function () {}
+
+  if (!self.writable) {
+    self._pendingData = buffer
+    self._pendingEncoding = encoding
+    self.once('connect', function () {
+      self._write(buffer, encoding, callback)
+    })
+    return
+  }
+  self._pendingData = null
+  self._pendingEncoding = null
+
+  // assuming buffer is browser implementation (`buffer` package on npm)
+  chrome.sockets.tcp.send(self.id, buffer.buffer /* buffer.toArrayBuffer() is slower */,
+                          function (sendInfo) {
+    if (sendInfo.resultCode < 0) {
+      var err = new Error('Socket ' + self.id + ' write error: ' + sendInfo.resultCode)
+      callback(err)
+      self.destroy(err)
+    } else {
+      self._resetTimeout()
+      callback(null)
+    }
+  })
+
+  self._bytesDispatched += buffer.length
+}
+
+Socket.prototype._read = function (bufferSize) {
+  var self = this
+  if (self._connecting) {
+    self.once('connect', self._read.bind(self, bufferSize))
+    return
+  }
+
+  chrome.sockets.tcp.setPaused(self.id, false)
+}
+
+Socket.prototype._onReceive = function (data) {
+  var self = this
+  var buffer = new Buffer(new Uint8Array(data))
+
+  self.bytesRead += buffer.length
+  self._resetTimeout()
+
+  if (!self.push(buffer)) { // if returns false, then apply backpressure
+    chrome.sockets.tcp.setPaused(self.id, true)
+  }
+}
+
+Socket.prototype._onReceiveError = function (resultCode) {
+  var self = this
+  if (resultCode === -100) {
+    self.push(null)
+    self.destroy()
+  } else if (resultCode < 0) {
+    self.destroy(new Error('Socket ' + self.id + ' receive error ' + resultCode))
+  }
+}
+
+/**
+ * The amount of bytes sent.
+ * @return {number}
+ */
+Object.defineProperty(Socket.prototype, 'bytesWritten', {
+  get: function () {
+    var self = this
+    var bytes = self._bytesDispatched
+
+    self._writableState.toArrayBuffer().forEach(function (el) {
+      if (Buffer.isBuffer(el.chunk))
+        bytes += el.chunk.length
+      else
+        bytes += new Buffer(el.chunk, el.encoding).length
+    })
+
+    if (self._pendingData) {
+      if (Buffer.isBuffer(self._pendingData))
+        bytes += self._pendingData.length
+      else
+        bytes += Buffer.byteLength(self._pendingData, self._pendingEncoding)
+    }
+
+    return bytes
+  }
+})
+
+Socket.prototype.destroy = function (exception) {
+  var self = this
+  self._destroy(exception)
+}
+
+Socket.prototype._destroy = function (exception, cb) {
+  var self = this
+
+  function fireErrorCallbacks () {
+    if (cb) cb(exception)
+    if (exception && !self.errorEmitted) {
+      process.nextTick(function () {
+        self.emit('error', exception)
+      })
+      self.errorEmitted = true
+    }
+  }
+
+  if (self.destroyed) {
+    // already destroyed, fire error callbacks
+    fireErrorCallbacks()
+    return
+  }
+
+  if (this.server) {
+    this.server._connections -= 1
+  }
+
+  self._connecting = false
+  this.readable = this.writable = false
+  self.destroyed = true
+  delete sockets[self.id]
+
+  chrome.sockets.tcp.disconnect(self.id, function () {
+    chrome.sockets.tcp.close(self.id, function () {
+      self.emit('close', !!exception)
+      fireErrorCallbacks()
+    })
+  })
+}
+
+/**
+ * Sets the socket to timeout after timeout milliseconds of inactivity on the socket.
+ * By default net.Socket do not have a timeout. When an idle timeout is triggered the
+ * socket will receive a 'timeout' event but the connection will not be severed. The
+ * user must manually end() or destroy() the socket.
+ *
+ * If timeout is 0, then the existing idle timeout is disabled.
+ *
+ * The optional callback parameter will be added as a one time listener for the 'timeout' event.
+ *
+ * @param {number}   timeout
+ * @param {function} callback
+ */
+Socket.prototype.setTimeout = function (timeout, callback) {
+  var self = this
+  if (callback) self.once('timeout', callback)
+  self._timeoutMs = timeout
+  self._resetTimeout()
+}
+
+Socket.prototype._onTimeout = function () {
+  var self = this
+  self._timeout = null
+  self._timeoutMs = 0
+  self.emit('timeout')
+}
+
+Socket.prototype._resetTimeout = function () {
+  var self = this
+  if (self._timeout) {
+    clearTimeout(self._timeout)
+  }
+  if (self._timeoutMs) {
+    self._timeout = setTimeout(self._onTimeout, self.timeoutMs)
+  }
+}
+
+/**
+ * Disables the Nagle algorithm. By default TCP connections use the Nagle
+ * algorithm, they buffer data before sending it off. Setting true for noDelay
+ * will immediately fire off data each time socket.write() is called. noDelay
+ * defaults to true.
+ *
+ * NOTE: The Chrome version of this function is async, whereas the node
+ * version is sync. Keep this in mind.
+ *
+ * @param {boolean} [noDelay] Optional
+ * @param {function} callback CHROME-SPECIFIC: Called when the configuration
+ *                            operation is done.
+ */
+Socket.prototype.setNoDelay = function (noDelay, callback) {
+  var self = this
+  // backwards compatibility: assume true when `enable` is omitted
+  noDelay = is.isUndefined(noDelay) ? true : !!noDelay
+  if (!callback) callback = function () {}
+  chrome.sockets.tcp.setNoDelay(self.id, noDelay, callback)
+}
+
+/**
+ * Enable/disable keep-alive functionality, and optionally set the initial
+ * delay before the first keepalive probe is sent on an idle socket. enable
+ * defaults to false.
+ *
+ * Set initialDelay (in milliseconds) to set the delay between the last data
+ * packet received and the first keepalive probe. Setting 0 for initialDelay
+ * will leave the value unchanged from the default (or previous) setting.
+ * Defaults to 0.
+ *
+ * NOTE: The Chrome version of this function is async, whereas the node
+ * version is sync. Keep this in mind.
+ *
+ * @param {boolean} [enable] Optional
+ * @param {number} [initialDelay]
+ * @param {function} callback CHROME-SPECIFIC: Called when the configuration
+ *                            operation is done.
+ */
+Socket.prototype.setKeepAlive = function (enable, initialDelay, callback) {
+  var self = this
+  if (!callback) callback = function () {}
+  chrome.sockets.tcp.setKeepAlive(self.id, !!enable, ~~(initialDelay / 1000),
+      callback)
+}
+
+/**
+ * Returns the bound address, the address family name and port of the socket
+ * as reported by the operating system. Returns an object with three
+ * properties, e.g. { port: 12346, family: 'IPv4', address: '127.0.0.1' }
+ *
+ * @return {Object} information
+ */
+Socket.prototype.address = function () {
+  var self = this
+  return {
+    address: self.localAddress,
+    port: self.localPort,
+    family: 'IPv4'
+  }
+}
+
+Object.defineProperty(Socket.prototype, 'readyState', {
+  get: function () {
+    var self = this
+    if (self._connecting) {
+      return 'opening'
+    } else if (self.readable && self.writable) {
+      return 'open'
+    } else {
+      return 'closed'
+    }
+  }
+})
+
+Socket.prototype.unref = function () {
+  // No chrome.socket equivalent
+}
+
+Socket.prototype.ref = function () {
+  // No chrome.socket equivalent
+}
+
+//
+// EXPORTED HELPERS
+//
+
+exports.isIP = function (input) {
+  try {
+    ipaddr.parse(input)
+  } catch (e) {
+    return false
+  }
+  return true
+}
+
+exports.isIPv4 = function (input) {
+  try {
+    var parsed = ipaddr.parse(input)
+    return (parsed.kind() === 'ipv4')
+  } catch (e) {
+    return false
+  }
+}
+
+exports.isIPv6 = function (input) {
+  try {
+    var parsed = ipaddr.parse(input)
+    return (parsed.kind() === 'ipv6')
+  } catch (e) {
+    return false
+  }
+}
+
+//
+// HELPERS
+//
+
+/**
+ * Returns an array [options] or [options, cb]
+ * It is the same as the argument of Socket.prototype.connect().
+ */
+function normalizeConnectArgs (args) {
+  var options = {}
+
+  if (is.isObject(args[0])) {
+    // connect(options, [cb])
+    options = args[0]
+  } else {
+    // connect(port, [host], [cb])
+    options.port = args[0]
+    if (is.isString(args[1])) {
+      options.host = args[1]
+    } else {
+      options.host = '127.0.0.1'
+    }
+  }
+
+  var cb = args[args.length - 1]
+  return is.isFunction(cb) ? [options, cb] : [options]
+}
+
+function toNumber (x) {
+  return (x = Number(x)) >= 0 ? x : false
+}
+
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
+},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24,"buffer":13,"core-util-is":2,"events":22,"inherits":3,"ipaddr.js":4,"stream":27}],2:[function(require,module,exports){
+(function (Buffer){
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+// NOTE: These type checking functions intentionally don't use `instanceof`
+// because it is fragile and can be easily faked with `Object.create()`.
+function isArray(ar) {
+  return Array.isArray(ar);
+}
+exports.isArray = isArray;
+
+function isBoolean(arg) {
+  return typeof arg === 'boolean';
+}
+exports.isBoolean = isBoolean;
+
+function isNull(arg) {
+  return arg === null;
+}
+exports.isNull = isNull;
+
+function isNullOrUndefined(arg) {
+  return arg == null;
+}
+exports.isNullOrUndefined = isNullOrUndefined;
+
+function isNumber(arg) {
+  return typeof arg === 'number';
+}
+exports.isNumber = isNumber;
+
+function isString(arg) {
+  return typeof arg === 'string';
+}
+exports.isString = isString;
+
+function isSymbol(arg) {
+  return typeof arg === 'symbol';
+}
+exports.isSymbol = isSymbol;
+
+function isUndefined(arg) {
+  return arg === void 0;
+}
+exports.isUndefined = isUndefined;
+
+function isRegExp(re) {
+  return isObject(re) && objectToString(re) === '[object RegExp]';
+}
+exports.isRegExp = isRegExp;
+
+function isObject(arg) {
+  return typeof arg === 'object' && arg !== null;
+}
+exports.isObject = isObject;
+
+function isDate(d) {
+  return isObject(d) && objectToString(d) === '[object Date]';
+}
+exports.isDate = isDate;
+
+function isError(e) {
+  return isObject(e) &&
+      (objectToString(e) === '[object Error]' || e instanceof Error);
+}
+exports.isError = isError;
+
+function isFunction(arg) {
+  return typeof arg === 'function';
+}
+exports.isFunction = isFunction;
+
+function isPrimitive(arg) {
+  return arg === null ||
+         typeof arg === 'boolean' ||
+         typeof arg === 'number' ||
+         typeof arg === 'string' ||
+         typeof arg === 'symbol' ||  // ES6 symbol
+         typeof arg === 'undefined';
+}
+exports.isPrimitive = isPrimitive;
+
+function isBuffer(arg) {
+  return Buffer.isBuffer(arg);
+}
+exports.isBuffer = isBuffer;
+
+function objectToString(o) {
+  return Object.prototype.toString.call(o);
+}
+}).call(this,require("buffer").Buffer)
+},{"buffer":13}],3:[function(require,module,exports){
+if (typeof Object.create === 'function') {
+  // implementation from standard node.js 'util' module
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    ctor.prototype = Object.create(superCtor.prototype, {
+      constructor: {
+        value: ctor,
+        enumerable: false,
+        writable: true,
+        configurable: true
+      }
+    });
+  };
+} else {
+  // old school shim for old browsers
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    var TempCtor = function () {}
+    TempCtor.prototype = superCtor.prototype
+    ctor.prototype = new TempCtor()
+    ctor.prototype.constructor = ctor
+  }
+}
+
+},{}],4:[function(require,module,exports){
+(function() {
+  var expandIPv6, ipaddr, ipv4Part, ipv4Regexes, ipv6Part, ipv6Regexes, matchCIDR, root;
+
+  ipaddr = {};
+
+  root = this;
+
+  if ((typeof module !== "undefined" && module !== null) && module.exports) {
+    module.exports = ipaddr;
+  } else {
+    root['ipaddr'] = ipaddr;
+  }
+
+  matchCIDR = function(first, second, partSize, cidrBits) {
+    var part, shift;
+    if (first.length !== second.length) {
+      throw new Error("ipaddr: cannot match CIDR for objects with different lengths");
+    }
+    part = 0;
+    while (cidrBits > 0) {
+      shift = partSize - cidrBits;
+      if (shift < 0) {
+        shift = 0;
+      }
+      if (first[part] >> shift !== second[part] >> shift) {
+        return false;
+      }
+      cidrBits -= partSize;
+      part += 1;
+    }
+    return true;
+  };
+
+  ipaddr.subnetMatch = function(address, rangeList, defaultName) {
+    var rangeName, rangeSubnets, subnet, _i, _len;
+    if (defaultName == null) {
+      defaultName = 'unicast';
+    }
+    for (rangeName in rangeList) {
+      rangeSubnets = rangeList[rangeName];
+      if (toString.call(rangeSubnets[0]) !== '[object Array]') {
+        rangeSubnets = [rangeSubnets];
+      }
+      for (_i = 0, _len = rangeSubnets.length; _i < _len; _i++) {
+        subnet = rangeSubnets[_i];
+        if (address.match.apply(address, subnet)) {
+          return rangeName;
+        }
+      }
+    }
+    return defaultName;
+  };
+
+  ipaddr.IPv4 = (function() {
+    function IPv4(octets) {
+      var octet, _i, _len;
+      if (octets.length !== 4) {
+        throw new Error("ipaddr: ipv4 octet count should be 4");
+      }
+      for (_i = 0, _len = octets.length; _i < _len; _i++) {
+        octet = octets[_i];
+        if (!((0 <= octet && octet <= 255))) {
+          throw new Error("ipaddr: ipv4 octet is a byte");
+        }
+      }
+      this.octets = octets;
+    }
+
+    IPv4.prototype.kind = function() {
+      return 'ipv4';
+    };
+
+    IPv4.prototype.toString = function() {
+      return this.octets.join(".");
+    };
+
+    IPv4.prototype.toByteArray = function() {
+      return this.octets.slice(0);
+    };
+
+    IPv4.prototype.match = function(other, cidrRange) {
+      if (other.kind() !== 'ipv4') {
+        throw new Error("ipaddr: cannot match ipv4 address with non-ipv4 one");
+      }
+      return matchCIDR(this.octets, other.octets, 8, cidrRange);
+    };
+
+    IPv4.prototype.SpecialRanges = {
+      broadcast: [[new IPv4([255, 255, 255, 255]), 32]],
+      multicast: [[new IPv4([224, 0, 0, 0]), 4]],
+      linkLocal: [[new IPv4([169, 254, 0, 0]), 16]],
+      loopback: [[new IPv4([127, 0, 0, 0]), 8]],
+      "private": [[new IPv4([10, 0, 0, 0]), 8], [new IPv4([172, 16, 0, 0]), 12], [new IPv4([192, 168, 0, 0]), 16]],
+      reserved: [[new IPv4([192, 0, 0, 0]), 24], [new IPv4([192, 0, 2, 0]), 24], [new IPv4([192, 88, 99, 0]), 24], [new IPv4([198, 51, 100, 0]), 24], [new IPv4([203, 0, 113, 0]), 24], [new IPv4([240, 0, 0, 0]), 4]]
+    };
+
+    IPv4.prototype.range = function() {
+      return ipaddr.subnetMatch(this, this.SpecialRanges);
+    };
+
+    IPv4.prototype.toIPv4MappedAddress = function() {
+      return ipaddr.IPv6.parse("::ffff:" + (this.toString()));
+    };
+
+    return IPv4;
+
+  })();
+
+  ipv4Part = "(0?\\d+|0x[a-f0-9]+)";
+
+  ipv4Regexes = {
+    fourOctet: new RegExp("^" + ipv4Part + "\\." + ipv4Part + "\\." + ipv4Part + "\\." + ipv4Part + "$", 'i'),
+    longValue: new RegExp("^" + ipv4Part + "$", 'i')
+  };
+
+  ipaddr.IPv4.parser = function(string) {
+    var match, parseIntAuto, part, shift, value;
+    parseIntAuto = function(string) {
+      if (string[0] === "0" && string[1] !== "x") {
+        return parseInt(string, 8);
+      } else {
+        return parseInt(string);
+      }
+    };
+    if (match = string.match(ipv4Regexes.fourOctet)) {
+      return (function() {
+        var _i, _len, _ref, _results;
+        _ref = match.slice(1, 6);
+        _results = [];
+        for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+          part = _ref[_i];
+          _results.push(parseIntAuto(part));
+        }
+        return _results;
+      })();
+    } else if (match = string.match(ipv4Regexes.longValue)) {
+      value = parseIntAuto(match[1]);
+      return ((function() {
+        var _i, _results;
+        _results = [];
+        for (shift = _i = 0; _i <= 24; shift = _i += 8) {
+          _results.push((value >> shift) & 0xff);
+        }
+        return _results;
+      })()).reverse();
+    } else {
+      return null;
+    }
+  };
+
+  ipaddr.IPv6 = (function() {
+    function IPv6(parts) {
+      var part, _i, _len;
+      if (parts.length !== 8) {
+        throw new Error("ipaddr: ipv6 part count should be 8");
+      }
+      for (_i = 0, _len = parts.length; _i < _len; _i++) {
+        part = parts[_i];
+        if (!((0 <= part && part <= 0xffff))) {
+          throw new Error("ipaddr: ipv6 part should fit to two octets");
+        }
+      }
+      this.parts = parts;
+    }
+
+    IPv6.prototype.kind = function() {
+      return 'ipv6';
+    };
+
+    IPv6.prototype.toString = function() {
+      var compactStringParts, part, pushPart, state, stringParts, _i, _len;
+      stringParts = (function() {
+        var _i, _len, _ref, _results;
+        _ref = this.parts;
+        _results = [];
+        for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+          part = _ref[_i];
+          _results.push(part.toString(16));
+        }
+        return _results;
+      }).call(this);
+      compactStringParts = [];
+      pushPart = function(part) {
+        return compactStringParts.push(part);
+      };
+      state = 0;
+      for (_i = 0, _len = stringParts.length; _i < _len; _i++) {
+        part = stringParts[_i];
+        switch (state) {
+          case 0:
+            if (part === '0') {
+              pushPart('');
+            } else {
+              pushPart(part);
+            }
+            state = 1;
+            break;
+          case 1:
+            if (part === '0') {
+              state = 2;
+            } else {
+              pushPart(part);
+            }
+            break;
+          case 2:
+            if (part !== '0') {
+              pushPart('');
+              pushPart(part);
+              state = 3;
+            }
+            break;
+          case 3:
+            pushPart(part);
+        }
+      }
+      if (state === 2) {
+        pushPart('');
+        pushPart('');
+      }
+      return compactStringParts.join(":");
+    };
+
+    IPv6.prototype.toByteArray = function() {
+      var bytes, part, _i, _len, _ref;
+      bytes = [];
+      _ref = this.parts;
+      for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+        part = _ref[_i];
+        bytes.push(part >> 8);
+        bytes.push(part & 0xff);
+      }
+      return bytes;
+    };
+
+    IPv6.prototype.toNormalizedString = function() {
+      var part;
+      return ((function() {
+        var _i, _len, _ref, _results;
+        _ref = this.parts;
+        _results = [];
+        for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+          part = _ref[_i];
+          _results.push(part.toString(16));
+        }
+        return _results;
+      }).call(this)).join(":");
+    };
+
+    IPv6.prototype.match = function(other, cidrRange) {
+      if (other.kind() !== 'ipv6') {
+        throw new Error("ipaddr: cannot match ipv6 address with non-ipv6 one");
+      }
+      return matchCIDR(this.parts, other.parts, 16, cidrRange);
+    };
+
+    IPv6.prototype.SpecialRanges = {
+      unspecified: [new IPv6([0, 0, 0, 0, 0, 0, 0, 0]), 128],
+      linkLocal: [new IPv6([0xfe80, 0, 0, 0, 0, 0, 0, 0]), 10],
+      multicast: [new IPv6([0xff00, 0, 0, 0, 0, 0, 0, 0]), 8],
+      loopback: [new IPv6([0, 0, 0, 0, 0, 0, 0, 1]), 128],
+      uniqueLocal: [new IPv6([0xfc00, 0, 0, 0, 0, 0, 0, 0]), 7],
+      ipv4Mapped: [new IPv6([0, 0, 0, 0, 0, 0xffff, 0, 0]), 96],
+      rfc6145: [new IPv6([0, 0, 0, 0, 0xffff, 0, 0, 0]), 96],
+      rfc6052: [new IPv6([0x64, 0xff9b, 0, 0, 0, 0, 0, 0]), 96],
+      '6to4': [new IPv6([0x2002, 0, 0, 0, 0, 0, 0, 0]), 16],
+      teredo: [new IPv6([0x2001, 0, 0, 0, 0, 0, 0, 0]), 32],
+      reserved: [[new IPv6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0]), 32]]
+    };
+
+    IPv6.prototype.range = function() {
+      return ipaddr.subnetMatch(this, this.SpecialRanges);
+    };
+
+    IPv6.prototype.isIPv4MappedAddress = function() {
+      return this.range() === 'ipv4Mapped';
+    };
+
+    IPv6.prototype.toIPv4Address = function() {
+      var high, low, _ref;
+      if (!this.isIPv4MappedAddress()) {
+        throw new Error("ipaddr: trying to convert a generic ipv6 address to ipv4");
+      }
+      _ref = this.parts.slice(-2), high = _ref[0], low = _ref[1];
+      return new ipaddr.IPv4([high >> 8, high & 0xff, low >> 8, low & 0xff]);
+    };
+
+    return IPv6;
+
+  })();
+
+  ipv6Part = "(?:[0-9a-f]+::?)+";
+
+  ipv6Regexes = {
+    "native": new RegExp("^(::)?(" + ipv6Part + ")?([0-9a-f]+)?(::)?$", 'i'),
+    transitional: new RegExp(("^((?:" + ipv6Part + ")|(?:::)(?:" + ipv6Part + ")?)") + ("" + ipv4Part + "\\." + ipv4Part + "\\." + ipv4Part + "\\." + ipv4Part + "$"), 'i')
+  };
+
+  expandIPv6 = function(string, parts) {
+    var colonCount, lastColon, part, replacement, replacementCount;
+    if (string.indexOf('::') !== string.lastIndexOf('::')) {
+      return null;
+    }
+    colonCount = 0;
+    lastColon = -1;
+    while ((lastColon = string.indexOf(':', lastColon + 1)) >= 0) {
+      colonCount++;
+    }
+    if (string[0] === ':') {
+      colonCount--;
+    }
+    if (string[string.length - 1] === ':') {
+      colonCount--;
+    }
+    replacementCount = parts - colonCount;
+    replacement = ':';
+    while (replacementCount--) {
+      replacement += '0:';
+    }
+    string = string.replace('::', replacement);
+    if (string[0] === ':') {
+      string = string.slice(1);
+    }
+    if (string[string.length - 1] === ':') {
+      string = string.slice(0, -1);
+    }
+    return (function() {
+      var _i, _len, _ref, _results;
+      _ref = string.split(":");
+      _results = [];
+      for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+        part = _ref[_i];
+        _results.push(parseInt(part, 16));
+      }
+      return _results;
+    })();
+  };
+
+  ipaddr.IPv6.parser = function(string) {
+    var match, parts;
+    if (string.match(ipv6Regexes['native'])) {
+      return expandIPv6(string, 8);
+    } else if (match = string.match(ipv6Regexes['transitional'])) {
+      parts = expandIPv6(match[1].slice(0, -1), 6);
+      if (parts) {
+        parts.push(parseInt(match[2]) << 8 | parseInt(match[3]));
+        parts.push(parseInt(match[4]) << 8 | parseInt(match[5]));
+        return parts;
+      }
+    }
+    return null;
+  };
+
+  ipaddr.IPv4.isIPv4 = ipaddr.IPv6.isIPv6 = function(string) {
+    return this.parser(string) !== null;
+  };
+
+  ipaddr.IPv4.isValid = ipaddr.IPv6.isValid = function(string) {
+    var e;
+    try {
+      new this(this.parser(string));
+      return true;
+    } catch (_error) {
+      e = _error;
+      return false;
+    }
+  };
+
+  ipaddr.IPv4.parse = ipaddr.IPv6.parse = function(string) {
+    var parts;
+    parts = this.parser(string);
+    if (parts === null) {
+      throw new Error("ipaddr: string is not formatted like ip address");
+    }
+    return new this(parts);
+  };
+
+  ipaddr.isValid = function(string) {
+    return ipaddr.IPv6.isValid(string) || ipaddr.IPv4.isValid(string);
+  };
+
+  ipaddr.parse = function(string) {
+    if (ipaddr.IPv6.isIPv6(string)) {
+      return ipaddr.IPv6.parse(string);
+    } else if (ipaddr.IPv4.isIPv4(string)) {
+      return ipaddr.IPv4.parse(string);
+    } else {
+      throw new Error("ipaddr: the address has neither IPv6 nor IPv4 format");
+    }
+  };
+
+  ipaddr.process = function(string) {
+    var addr;
+    addr = this.parse(string);
+    if (addr.kind() === 'ipv6' && addr.isIPv4MappedAddress()) {
+      return addr.toIPv4Address();
+    } else {
+      return addr;
+    }
+  };
+
+}).call(this);
+
+},{}],5:[function(require,module,exports){
+(function (Buffer){
+// Generated by CoffeeScript 1.7.1
+(function() {
+  var EVP_BytesToKey, Encryptor, bytes_to_key_results, cachedTables, crypto, encryptAll, getTable, int32Max, merge_sort, method_supported, substitute, to_buffer, util;
+
+  crypto = require("crypto");
+
+  util = require("util");
+
+  merge_sort = require("./merge_sort").merge_sort;
+
+  int32Max = Math.pow(2, 32);
+
+  cachedTables = {};
+
+  getTable = function(key) {
+    var ah, al, decrypt_table, hash, i, md5sum, result, table;
+    if (cachedTables[key]) {
+      return cachedTables[key];
+    }
+    util.log("calculating ciphers");
+    table = new Array(256);
+    decrypt_table = new Array(256);
+    md5sum = crypto.createHash("md5");
+    md5sum.update(key);
+    hash = new Buffer(md5sum.digest(), "binary");
+    al = hash.readUInt32LE(0);
+    ah = hash.readUInt32LE(4);
+    i = 0;
+    while (i < 256) {
+      table[i] = i;
+      i++;
+    }
+    i = 1;
+    while (i < 1024) {
+      table = merge_sort(table, function(x, y) {
+        return ((ah % (x + i)) * int32Max + al) % (x + i) - ((ah % (y + i)) * int32Max + al) % (y + i);
+      });
+      i++;
+    }
+    i = 0;
+    while (i < 256) {
+      decrypt_table[table[i]] = i;
+      ++i;
+    }
+    result = [table, decrypt_table];
+    cachedTables[key] = result;
+    return result;
+  };
+
+  substitute = function(table, buf) {
+    var i;
+    i = 0;
+    while (i < buf.length) {
+      buf[i] = table[buf[i]];
+      i++;
+    }
+    return buf;
+  };
+
+  to_buffer = function(input) {
+    if (input.copy != null) {
+      return input;
+    } else {
+      return new Buffer(input, 'binary');
+    }
+  };
+
+  bytes_to_key_results = {};
+
+  EVP_BytesToKey = function(password, key_len, iv_len) {
+    var count, d, data, i, iv, key, m, md5, ms;
+    if (bytes_to_key_results[password]) {
+      return bytes_to_key_results[password];
+    }
+    m = [];
+    i = 0;
+    count = 0;
+    while (count < key_len + iv_len) {
+      md5 = crypto.createHash('md5');
+      data = password;
+      if (i > 0) {
+        data = Buffer.concat([m[i - 1], password]);
+      }
+      md5.update(data);
+      d = to_buffer(md5.digest());
+      m.push(d);
+      count += d.length;
+      i += 1;
+    }
+    ms = Buffer.concat(m);
+    key = ms.slice(0, key_len);
+    iv = ms.slice(key_len, key_len + iv_len);
+    bytes_to_key_results[password] = [key, iv];
+    return [key, iv];
+  };
+
+  method_supported = {
+    'aes-128-cfb': [16, 16],
+    'aes-192-cfb': [24, 16],
+    'aes-256-cfb': [32, 16],
+    'bf-cfb': [16, 8],
+    'camellia-128-cfb': [16, 16],
+    'camellia-192-cfb': [24, 16],
+    'camellia-256-cfb': [32, 16],
+    'cast5-cfb': [16, 8],
+    'des-cfb': [8, 8],
+    'idea-cfb': [16, 8],
+    'rc2-cfb': [16, 8],
+    'rc4': [16, 0],
+    'seed-cfb': [16, 16]
+  };
+
+  Encryptor = (function() {
+    function Encryptor(key, method) {
+      var _ref;
+      this.key = key;
+      this.method = method;
+      this.iv_sent = false;
+      if (this.method === 'table') {
+        this.method = null;
+      }
+      if (this.method != null) {
+        this.cipher = this.get_cipher(this.key, this.method, 1, crypto.randomBytes(32));
+      } else {
+        _ref = getTable(this.key), this.encryptTable = _ref[0], this.decryptTable = _ref[1];
+      }
+    }
+
+    Encryptor.prototype.get_cipher_len = function(method) {
+      var m;
+      method = method.toLowerCase();
+      m = method_supported[method];
+      return m;
+    };
+
+    Encryptor.prototype.get_cipher = function(password, method, op, iv) {
+      var iv_, key, m, _ref;
+      method = method.toLowerCase();
+      password = Buffer(password, 'binary');
+      m = this.get_cipher_len(method);
+      if (m != null) {
+        _ref = EVP_BytesToKey(password, m[0], m[1]), key = _ref[0], iv_ = _ref[1];
+        if (iv == null) {
+          iv = iv_;
+        }
+        if (op === 1) {
+          this.cipher_iv = iv.slice(0, m[1]);
+        }
+        iv = iv.slice(0, m[1]);
+        if (op === 1) {
+          return crypto.createCipheriv(method, key, iv);
+        } else {
+          return crypto.createDecipheriv(method, key, iv);
+        }
+      }
+    };
+
+    Encryptor.prototype.encrypt = function(buf) {
+      var result;
+      if (this.method != null) {
+        result = to_buffer(this.cipher.update(buf.toString('binary')));
+        if (this.iv_sent) {
+          return result;
+        } else {
+          this.iv_sent = true;
+          return Buffer.concat([this.cipher_iv, result]);
+        }
+      } else {
+        return substitute(this.encryptTable, buf);
+      }
+    };
+
+    Encryptor.prototype.decrypt = function(buf) {
+      var decipher_iv, decipher_iv_len, result;
+      if (this.method != null) {
+        if (this.decipher == null) {
+          decipher_iv_len = this.get_cipher_len(this.method)[1];
+          decipher_iv = buf.slice(0, decipher_iv_len);
+          this.decipher = this.get_cipher(this.key, this.method, 0, decipher_iv);
+          result = to_buffer(this.decipher.update(buf.slice(decipher_iv_len).toString('binary')));
+          return result;
+        } else {
+          result = to_buffer(this.decipher.update(buf.toString('binary')));
+          return result;
+        }
+      } else {
+        return substitute(this.decryptTable, buf);
+      }
+    };
+
+    return Encryptor;
+
+  })();
+
+  encryptAll = function(password, method, op, data) {
+    var cipher, decryptTable, encryptTable, iv, ivLen, iv_, key, keyLen, result, _ref, _ref1, _ref2;
+    if (method === 'table') {
+      method = null;
+    }
+    if (method == null) {
+      _ref = getTable(password), encryptTable = _ref[0], decryptTable = _ref[1];
+      if (op === 0) {
+        return substitute(decryptTable, data);
+      } else {
+        return substitute(encryptTable, data);
+      }
+    } else {
+      result = [];
+      method = method.toLowerCase();
+      _ref1 = method_supported[method], keyLen = _ref1[0], ivLen = _ref1[1];
+      password = Buffer(password, 'binary');
+      _ref2 = EVP_BytesToKey(password, keyLen, ivLen), key = _ref2[0], iv_ = _ref2[1];
+      if (op === 1) {
+        iv = crypto.randomBytes(ivLen);
+        result.push(iv);
+      } else {
+        iv = data.slice(0, ivLen);
+        data = data.slice(ivLen);
+      }
+      if (op === 1) {
+        cipher = crypto.createCipheriv(method, key, iv);
+      } else {
+        cipher = crypto.createDecipheriv(method, key, iv);
+      }
+      result.push(cipher.update(data));
+      result.push(cipher.final());
+      return Buffer.concat(result);
+    }
+  };
+
+  exports.Encryptor = Encryptor;
+
+  exports.getTable = getTable;
+
+  exports.encryptAll = encryptAll;
+
+}).call(this);
+
+}).call(this,require("buffer").Buffer)
+},{"./merge_sort":8,"buffer":13,"crypto":17,"util":35}],6:[function(require,module,exports){
+// The functions in source file is from phpjs
+// https://github.com/kvz/phpjs
+// See license below
+//
+// Copyright (c) 2013 Kevin van Zonneveld (http://kvz.io) 
+// and Contributors (http://phpjs.org/authors)
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+// of the Software, and to permit persons to whom the Software is furnished to do
+// so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+
+
+function inet_pton (a) {
+  // http://kevin.vanzonneveld.net
+  // +   original by: Theriault
+  // *     example 1: inet_pton('::');
+  // *     returns 1: '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0' (binary)
+  // *     example 2: inet_pton('127.0.0.1');
+  // *     returns 2: '\x7F\x00\x00\x01' (binary)
+  var r, m, x, i, j, f = String.fromCharCode;
+  m = a.match(/^(?:\d{1,3}(?:\.|$)){4}/); // IPv4
+  if (m) {
+    m = m[0].split('.');
+    m = f(m[0]) + f(m[1]) + f(m[2]) + f(m[3]);
+    // Return if 4 bytes, otherwise false.
+    return m.length === 4 ? m : false;
+  }
+  r = /^((?:[\da-f]{1,4}(?::|)){0,8})(::)?((?:[\da-f]{1,4}(?::|)){0,8})$/;
+  m = a.match(r); // IPv6
+  if (m) {
+    // Translate each hexadecimal value.
+    for (j = 1; j < 4; j++) {
+      // Indice 2 is :: and if no length, continue.
+      if (j === 2 || m[j].length === 0) {
+        continue;
+      }
+      m[j] = m[j].split(':');
+      for (i = 0; i < m[j].length; i++) {
+        m[j][i] = parseInt(m[j][i], 16);
+        // Would be NaN if it was blank, return false.
+        if (isNaN(m[j][i])) {
+          return false; // Invalid IP.
+        }
+        m[j][i] = f(m[j][i] >> 8) + f(m[j][i] & 0xFF);
+      }
+      m[j] = m[j].join('');
+    }
+    x = m[1].length + m[3].length;
+    if (x === 16) {
+      return m[1] + m[3];
+    } else if (x < 16 && m[2].length > 0) {
+      return m[1] + (new Array(16 - x + 1)).join('\x00') + m[3];
+    }
+  }
+  return false; // Invalid IP.
+}
+
+function inet_ntop (a) {
+  // http://kevin.vanzonneveld.net
+  // +   original by: Theriault
+  // *     example 1: inet_ntop('\x7F\x00\x00\x01');
+  // *     returns 1: '127.0.0.1'
+  // *     example 2: inet_ntop('\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\1');
+  // *     returns 2: '::1'
+  var i = 0,
+    m = '',
+    c = [];
+  if (a.length === 4) { // IPv4
+    a += '';
+    return [
+    a.charCodeAt(0), a.charCodeAt(1), a.charCodeAt(2), a.charCodeAt(3)].join('.');
+  } else if (a.length === 16) { // IPv6
+    for (i = 0; i < 16; i += 2) {
+      var group = (a.slice(i, i + 2)).toString("hex");
+      //replace 00b1 => b1  0000=>0
+      while(group.length > 1 && group.slice(0,1) == '0')
+        group = group.slice(1);
+      c.push(group);
+    }
+    return c.join(':').replace(/((^|:)0(?=:|$))+:?/g, function (t) {
+      m = (t.length > m.length) ? t : m;
+      return t;
+    }).replace(m || ' ', '::');
+  } else { // Invalid length
+    return false;
+  }
+}
+exports.inet_pton = inet_pton;
+exports.inet_ntop = inet_ntop;
+
+},{}],7:[function(require,module,exports){
+(function (process,Buffer){
+// Generated by CoffeeScript 1.7.1
+(function() {
+  var Encryptor, connections, createServer, fs, inet, inetAton, inetNtoa, net, path, udpRelay, utils;
+
+  net = require("chrome-net");
+
+
+  path = require("path");
+
+  udpRelay = require("./udprelay");
+
+  utils = require('./utils');
+
+  inet = require('./inet');
+
+  Encryptor = require("./encrypt").Encryptor;
+
+  inetNtoa = function(buf) {
+    return buf[0] + "." + buf[1] + "." + buf[2] + "." + buf[3];
+  };
+
+  inetAton = function(ipStr) {
+    var buf, i, parts;
+    parts = ipStr.split(".");
+    if (parts.length !== 4) {
+      return null;
+    } else {
+      buf = new Buffer(4);
+      i = 0;
+      while (i < 4) {
+        buf[i] = +parts[i];
+        i++;
+      }
+      return buf;
+    }
+  };
+
+  connections = 0;
+
+  createServer = function(serverAddr, serverPort, port, key, method, timeout, local_address) {
+    var getServer, server, udpServer;
+    if (local_address == null) {
+      local_address = null;
+    }
+    getServer = function() {
+      var aPort, aServer, r;
+      aPort = serverPort;
+      aServer = serverAddr;
+      if (serverPort instanceof Array) {
+        aPort = serverPort[Math.floor(Math.random() * serverPort.length)];
+      }
+      if (serverAddr instanceof Array) {
+        aServer = serverAddr[Math.floor(Math.random() * serverAddr.length)];
+      }
+      r = /^(.*)\:(\d+)$/.exec(aServer);
+      if (r != null) {
+        aServer = r[1];
+        aPort = +r[2];
+      }
+      return [aServer, aPort];
+    };
+    server = net.createServer(function(connection) {
+      var addrLen, addrToSend, cachedPieces, clean, encryptor, headerLength, remote, remoteAddr, remotePort, stage;
+      connections += 1;
+      console.info(connection);
+      encryptor = new Encryptor(key, method);
+      stage = 0;
+      headerLength = 0;
+      remote = null;
+      cachedPieces = [];
+      addrLen = 0;
+      remoteAddr = null;
+      remotePort = null;
+      addrToSend = "";
+      utils.debug("connections: " + connections);
+      clean = function() {
+        utils.debug("clean");
+        connections -= 1;
+        remote = null;
+        connection = null;
+        encryptor = null;
+        return utils.debug("connections: " + connections);
+      };
+      connection.on("data", function(data) {
+        var aPort, aServer, addrtype, buf, cmd, e, reply, tempBuf, _ref;
+        utils.log(utils.EVERYTHING, "connection on data");
+        console.info(data);
+        if (stage === 5) {
+          data = encryptor.encrypt(data);
+          if (!remote.write(data)) {
+            connection.pause();
+          }
+          return;
+        }
+        if (stage === 0) {
+          tempBuf = new Buffer(2);
+          tempBuf.write("\u0005\u0000", 0);
+          connection.write(tempBuf);
+          stage = 1;
+          utils.debug("stage = 1");
+          return;
+        }
+        if (stage === 1) {
+          try {
+            cmd = data[1];
+            addrtype = data[3];
+            if (cmd === 1) {
+
+            } else if (cmd === 3) {
+              utils.info("UDP assc request from " + connection.localAddress + ":" + connection.localPort);
+              reply = new Buffer(10);
+              reply.write("\u0005\u0000\u0000\u0001", 0, 4, "binary");
+              utils.debug(connection.localAddress);
+              inetAton(connection.localAddress).copy(reply, 4);
+              reply.writeUInt16BE(connection.localPort, 8);
+              connection.write(reply);
+              stage = 10;
+            } else {
+              utils.error("unsupported cmd: " + cmd);
+              reply = new Buffer("\u0005\u0007\u0000\u0001", "binary");
+              connection.end(reply);
+              return;
+            }
+            if (addrtype === 3) {
+              addrLen = data[4];
+            } else if (addrtype !== 1 && addrtype !== 4) {
+              utils.error("unsupported addrtype: " + addrtype);
+              connection.destroy();
+              return;
+            }
+            addrToSend = data.slice(3, 4).toString("binary");
+            if (addrtype === 1) {
+              remoteAddr = inetNtoa(data.slice(4, 8));
+              addrToSend += data.slice(4, 10).toString("binary");
+              remotePort = data.readUInt16BE(8);
+              headerLength = 10;
+            } else if (addrtype === 4) {
+              remoteAddr = inet.inet_ntop(data.slice(4, 20));
+              addrToSend += data.slice(4, 22).toString("binary");
+              remotePort = data.readUInt16BE(20);
+              headerLength = 22;
+            } else {
+              remoteAddr = data.slice(5, 5 + addrLen).toString("binary");
+              addrToSend += data.slice(4, 5 + addrLen + 2).toString("binary");
+              remotePort = data.readUInt16BE(5 + addrLen);
+              headerLength = 5 + addrLen + 2;
+            }
+            if (cmd === 3) {
+              utils.info("UDP assc: " + remoteAddr + ":" + remotePort);
+              return;
+            }
+            buf = new Buffer(10);
+            buf.write("\u0005\u0000\u0000\u0001", 0, 4, "binary");
+            buf.write("\u0000\u0000\u0000\u0000", 4, 4, "binary");
+            buf.writeInt16BE(2222, 8);
+            connection.write(buf);
+            _ref = getServer(), aServer = _ref[0], aPort = _ref[1];
+            utils.info("connecting " + aServer + ":" + aPort);
+            remote = net.connect(aPort, aServer, function() {
+              var addrToSendBuf, i, piece;
+              if (!encryptor) {
+                if (remote) {
+                  remote.destroy();
+                }
+                return;
+              }
+              addrToSendBuf = new Buffer(addrToSend, "binary");
+              addrToSendBuf = encryptor.encrypt(addrToSendBuf);
+              remote.write(addrToSendBuf);
+              i = 0;
+              while (i < cachedPieces.length) {
+                piece = cachedPieces[i];
+                piece = encryptor.encrypt(piece);
+                remote.write(piece);
+                i++;
+              }
+              cachedPieces = null;
+              stage = 5;
+              return utils.debug("stage = 5");
+            });
+            remote.on("data", function(data) {
+              var e;
+              utils.log(utils.EVERYTHING, "remote on data");
+              try {
+                if (encryptor) {
+                  data = encryptor.decrypt(data);
+                  if (!connection.write(data)) {
+                    return remote.pause();
+                  }
+                } else {
+                  return remote.destroy();
+                }
+              } catch (_error) {
+                e = _error;
+                utils.error(e);
+                if (remote) {
+                  remote.destroy();
+                }
+                if (connection) {
+                  return connection.destroy();
+                }
+              }
+            });
+            remote.on("end", function() {
+              utils.debug("remote on end");
+              if (connection) {
+                return connection.end();
+              }
+            });
+            remote.on("error", function(e) {
+              utils.debug("remote on error");
+              return utils.error("remote " + remoteAddr + ":" + remotePort + " error: " + e);
+            });
+            remote.on("close", function(had_error) {
+              utils.debug("remote on close:" + had_error);
+              if (had_error) {
+                if (connection) {
+                  return connection.destroy();
+                }
+              } else {
+                if (connection) {
+                  return connection.end();
+                }
+              }
+            });
+            remote.on("drain", function() {
+              utils.debug("remote on drain");
+              if (connection) {
+                return connection.resume();
+              }
+            });
+            remote.setTimeout(timeout, function() {
+              utils.debug("remote on timeout");
+              if (remote) {
+                remote.destroy();
+              }
+              if (connection) {
+                return connection.destroy();
+              }
+            });
+            if (data.length > headerLength) {
+              buf = new Buffer(data.length - headerLength);
+              data.copy(buf, 0, headerLength);
+              cachedPieces.push(buf);
+              buf = null;
+            }
+            stage = 4;
+            return utils.debug("stage = 4");
+          } catch (_error) {
+            e = _error;
+            utils.error(e);
+            if (connection) {
+              connection.destroy();
+            }
+            if (remote) {
+              return remote.destroy();
+            }
+          }
+        } else {
+          if (stage === 4) {
+            return cachedPieces.push(data);
+          }
+        }
+      });
+      connection.on("end", function() {
+        utils.debug("connection on end");
+        if (remote) {
+          return remote.end();
+        }
+      });
+      connection.on("error", function(e) {
+        utils.debug("connection on error");
+        return utils.error("local error: " + e);
+      });
+      connection.on("close", function(had_error) {
+        utils.debug("connection on close:" + had_error);
+        if (had_error) {
+          if (remote) {
+            remote.destroy();
+          }
+        } else {
+          if (remote) {
+            remote.end();
+          }
+        }
+        return clean();
+      });
+      connection.on("drain", function() {
+        utils.debug("connection on drain");
+        if (remote && stage === 5) {
+          return remote.resume();
+        }
+      });
+      return connection.setTimeout(timeout, function() {
+        utils.debug("connection on timeout");
+        if (remote) {
+          remote.destroy();
+        }
+        if (connection) {
+          return connection.destroy();
+        }
+      });
+    });
+    if (local_address != null) {
+      server.listen(port, local_address, function() {
+        return utils.info("local listening at " + (server.address().address) + ":" + port);
+      });
+    } else {
+      server.listen(port, function() {
+        return utils.info("local listening at 0.0.0.0:" + port);
+      });
+    }
+    server.on("error", function(e) {
+      if (e.code === "EADDRINUSE") {
+        return utils.error("Address in use, aborting");
+      } else {
+        return utils.error(e);
+      }
+    });
+    server.on("close", function() {
+    });
+    return server;
+  };
+
+  exports.createServer = createServer;
+
+  exports.main = function() {
+    var KEY, METHOD, PORT, REMOTE_PORT, SERVER, config, configContent, configFromArgs, configPath, e, k, local_address, s, timeout, v;
+    console.log(utils.version);
+    configFromArgs = utils.parseArgs();
+    configPath = 'config.json';
+
+    config = {
+      "server":"128.199.243.158",
+      "server_port": 10000,
+      "local_port":1081,
+      "password": ".nmd!",
+      "timeout":600,
+      "method":"table"
+    };
+    for (k in configFromArgs) {
+      v = configFromArgs[k];
+      config[k] = v;
+    }
+    if (config.verbose) {
+      utils.config(utils.DEBUG);
+    }
+    utils.checkConfig(config);
+    SERVER = config.server;
+    REMOTE_PORT = config.server_port;
+    PORT = config.local_port;
+    KEY = config.password;
+    METHOD = config.method;
+    local_address = config.local_address;
+    if (!(SERVER && REMOTE_PORT && PORT && KEY)) {
+      utils.warn('config.json not found, you have to specify all config in commandline');
+      process.exit(1);
+    }
+    timeout = Math.floor(config.timeout * 1000) || 600000;
+    s = createServer(SERVER, REMOTE_PORT, PORT, KEY, METHOD, timeout, local_address);
+    return s.on("error", function(e) {
+      return process.stdout.on('drain', function() {
+        return process.exit(1);
+      });
+    });
+  };
+
+  if (require.main === module) {
+    exports.main();
+  }
+
+}).call(this);
+
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
+},{"./encrypt":5,"./inet":6,"./udprelay":9,"./utils":10,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24,"buffer":13,"chrome-net":1,"path":25}],8:[function(require,module,exports){
+// Generated by CoffeeScript 1.7.1
+(function() {
+  var merge, merge_sort;
+
+  merge = function(left, right, comparison) {
+    var result;
+    result = new Array();
+    while ((left.length > 0) && (right.length > 0)) {
+      if (comparison(left[0], right[0]) <= 0) {
+        result.push(left.shift());
+      } else {
+        result.push(right.shift());
+      }
+    }
+    while (left.length > 0) {
+      result.push(left.shift());
+    }
+    while (right.length > 0) {
+      result.push(right.shift());
+    }
+    return result;
+  };
+
+  merge_sort = function(array, comparison) {
+    var middle;
+    if (array.length < 2) {
+      return array;
+    }
+    middle = Math.ceil(array.length / 2);
+    return merge(merge_sort(array.slice(0, middle), comparison), merge_sort(array.slice(middle), comparison), comparison);
+  };
+
+  exports.merge_sort = merge_sort;
+
+}).call(this);
+
+},{}],9:[function(require,module,exports){
+(function (process,Buffer){
+// Generated by CoffeeScript 1.7.1
+(function() {
+  var LRUCache, decrypt, dgram, encrypt, encryptor, inet, inetAton, inetNtoa, net, parseHeader, utils;
+
+  utils = require('./utils');
+
+  inet = require('./inet');
+
+  encryptor = require('./encrypt');
+
+  inetNtoa = function(buf) {
+    return buf[0] + "." + buf[1] + "." + buf[2] + "." + buf[3];
+  };
+
+  inetAton = function(ipStr) {
+    var buf, i, parts;
+    parts = ipStr.split(".");
+    if (parts.length !== 4) {
+      return null;
+    } else {
+      buf = new Buffer(4);
+      i = 0;
+      while (i < 4) {
+        buf[i] = +parts[i];
+        i++;
+      }
+      return buf;
+    }
+  };
+
+  dgram = require('dgram');
+
+  net = require('net');
+
+  LRUCache = (function() {
+    function LRUCache(timeout, sweepInterval) {
+      var sweepFun, that;
+      this.timeout = timeout;
+      that = this;
+      sweepFun = function() {
+        return that.sweep();
+      };
+      this.interval = setInterval(sweepFun, sweepInterval);
+      this.dict = {};
+    }
+
+    LRUCache.prototype.setItem = function(key, value) {
+      var cur;
+      cur = process.hrtime();
+      return this.dict[key] = [value, cur];
+    };
+
+    LRUCache.prototype.getItem = function(key) {
+      var v;
+      v = this.dict[key];
+      if (v) {
+        v[1] = process.hrtime();
+        return v[0];
+      }
+      return null;
+    };
+
+    LRUCache.prototype.delItem = function(key) {
+      return delete this.dict[key];
+    };
+
+    LRUCache.prototype.destroy = function() {
+      return clearInterval(this.interval);
+    };
+
+    LRUCache.prototype.sweep = function() {
+      var dict, diff, k, keys, swept, v, v0, _i, _len;
+      utils.debug("sweeping");
+      dict = this.dict;
+      keys = Object.keys(dict);
+      swept = 0;
+      for (_i = 0, _len = keys.length; _i < _len; _i++) {
+        k = keys[_i];
+        v = dict[k];
+        diff = process.hrtime(v[1]);
+        if (diff[0] > this.timeout * 0.001) {
+          swept += 1;
+          v0 = v[0];
+          v0.close();
+          delete dict[k];
+        }
+      }
+      return utils.debug("" + swept + " keys swept");
+    };
+
+    return LRUCache;
+
+  })();
+
+  encrypt = function(password, method, data) {
+    var e;
+    try {
+      return encryptor.encryptAll(password, method, 1, data);
+    } catch (_error) {
+      e = _error;
+      utils.error(e);
+      return null;
+    }
+  };
+
+  decrypt = function(password, method, data) {
+    var e;
+    try {
+      return encryptor.encryptAll(password, method, 0, data);
+    } catch (_error) {
+      e = _error;
+      utils.error(e);
+      return null;
+    }
+  };
+
+  parseHeader = function(data, requestHeaderOffset) {
+    var addrLen, addrtype, destAddr, destPort, headerLength;
+    addrtype = data[requestHeaderOffset];
+    if (addrtype === 3) {
+      addrLen = data[requestHeaderOffset + 1];
+    } else if (addrtype !== 1 && addrtype !== 4) {
+      utils.warn("unsupported addrtype: " + addrtype);
+      return null;
+    }
+    if (addrtype === 1) {
+      destAddr = inetNtoa(data.slice(requestHeaderOffset + 1, requestHeaderOffset + 5));
+      destPort = data.readUInt16BE(requestHeaderOffset + 5);
+      headerLength = requestHeaderOffset + 7;
+    } else if (addrtype === 4) {
+      destAddr = inet.inet_ntop(data.slice(requestHeaderOffset + 1, requestHeaderOffset + 17));
+      destPort = data.readUInt16BE(requestHeaderOffset + 17);
+      headerLength = requestHeaderOffset + 19;
+    } else {
+      destAddr = data.slice(requestHeaderOffset + 2, requestHeaderOffset + 2 + addrLen).toString("binary");
+      destPort = data.readUInt16BE(requestHeaderOffset + 2 + addrLen);
+      headerLength = requestHeaderOffset + 2 + addrLen + 2;
+    }
+    return [addrtype, destAddr, destPort, headerLength];
+  };
+
+  exports.createServer = function(listenAddr, listenPort, remoteAddr, remotePort, password, method, timeout, isLocal) {
+    var clientKey, clients, listenIPType, server, udpTypeToListen, udpTypesToListen, _i, _len;
+    udpTypesToListen = [];
+    if (listenAddr == null) {
+      udpTypesToListen = ['udp4', 'udp6'];
+    } else {
+      listenIPType = net.isIP(listenAddr);
+      if (listenIPType === 6) {
+        udpTypesToListen.push('udp6');
+      } else {
+        udpTypesToListen.push('udp4');
+      }
+    }
+    for (_i = 0, _len = udpTypesToListen.length; _i < _len; _i++) {
+      udpTypeToListen = udpTypesToListen[_i];
+      server = dgram.createSocket(udpTypeToListen);
+      clients = new LRUCache(timeout, 10 * 1000);
+      clientKey = function(localAddr, localPort, destAddr, destPort) {
+        return "" + localAddr + ":" + localPort + ":" + destAddr + ":" + destPort;
+      };
+      server.on("message", function(data, rinfo) {
+        var addrtype, client, clientUdpType, dataToSend, destAddr, destPort, frag, headerLength, headerResult, key, requestHeaderOffset, sendDataOffset, serverAddr, serverPort, _ref, _ref1;
+        requestHeaderOffset = 0;
+        if (isLocal) {
+          requestHeaderOffset = 3;
+          frag = data[2];
+          if (frag !== 0) {
+            utils.debug("frag:" + frag);
+            utils.warn("drop a message since frag is not 0");
+            return;
+          }
+        } else {
+          data = decrypt(password, method, data);
+          if (data == null) {
+            return;
+          }
+        }
+        headerResult = parseHeader(data, requestHeaderOffset);
+        if (headerResult === null) {
+          return;
+        }
+        addrtype = headerResult[0], destAddr = headerResult[1], destPort = headerResult[2], headerLength = headerResult[3];
+        if (isLocal) {
+          sendDataOffset = requestHeaderOffset;
+          _ref = [remoteAddr, remotePort], serverAddr = _ref[0], serverPort = _ref[1];
+        } else {
+          sendDataOffset = headerLength;
+          _ref1 = [destAddr, destPort], serverAddr = _ref1[0], serverPort = _ref1[1];
+        }
+        key = clientKey(rinfo.address, rinfo.port, destAddr, destPort);
+        client = clients.getItem(key);
+        if (client == null) {
+          clientUdpType = net.isIP(serverAddr);
+          if (clientUdpType === 6) {
+            client = dgram.createSocket("udp6");
+          } else {
+            client = dgram.createSocket("udp4");
+          }
+          clients.setItem(key, client);
+          client.on("message", function(data1, rinfo1) {
+            var data2, responseHeader, serverIPBuf, _ref2;
+            if (!isLocal) {
+              utils.debug("UDP recv from " + rinfo1.address + ":" + rinfo1.port);
+              serverIPBuf = inetAton(rinfo1.address);
+              responseHeader = new Buffer(7);
+              responseHeader.write('\x01', 0);
+              serverIPBuf.copy(responseHeader, 1, 0, 4);
+              responseHeader.writeUInt16BE(rinfo1.port, 5);
+              data2 = Buffer.concat([responseHeader, data1]);
+              data2 = encrypt(password, method, data2);
+              if (data2 == null) {
+                return;
+              }
+            } else {
+              responseHeader = new Buffer("\x00\x00\x00");
+              data1 = decrypt(password, method, data1);
+              if (data1 == null) {
+                return;
+              }
+              _ref2 = parseHeader(data1, 0), addrtype = _ref2[0], destAddr = _ref2[1], destPort = _ref2[2], headerLength = _ref2[3];
+              utils.debug("UDP recv from " + destAddr + ":" + destPort);
+              data2 = Buffer.concat([responseHeader, data1]);
+            }
+            return server.send(data2, 0, data2.length, rinfo.port, rinfo.address, function(err, bytes) {
+              return utils.debug("remote to local sent");
+            });
+          });
+          client.on("error", function(err) {
+            return utils.error("UDP client error: " + err);
+          });
+          client.on("close", function() {
+            utils.debug("UDP client close");
+            return clients.delItem(key);
+          });
+        }
+        utils.debug("pairs: " + (Object.keys(clients.dict).length));
+        dataToSend = data.slice(sendDataOffset, data.length);
+        if (isLocal) {
+          dataToSend = encrypt(password, method, dataToSend);
+          if (dataToSend == null) {
+            return;
+          }
+        }
+        utils.debug("UDP send to " + destAddr + ":" + destPort);
+        return client.send(dataToSend, 0, dataToSend.length, serverPort, serverAddr, function(err, bytes) {
+          return utils.debug("local to remote sent");
+        });
+      });
+      server.on("listening", function() {
+        var address;
+        address = server.address();
+        return utils.info("UDP server listening " + address.address + ":" + address.port);
+      });
+      server.on("close", function() {
+        utils.info("UDP server closing");
+        return clients.destroy();
+      });
+      if (listenAddr != null) {
+        server.bind(listenPort, listenAddr);
+      } else {
+        server.bind(listenPort);
+      }
+      return server;
+    }
+  };
+
+}).call(this);
+
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
+},{"./encrypt":5,"./inet":6,"./utils":10,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24,"buffer":13,"dgram":12,"net":12}],10:[function(require,module,exports){
+(function (process,global){
+// Generated by CoffeeScript 1.7.1
+(function() {
+  var util, _logging_level;
+
+  util = require('util');
+
+  exports.parseArgs = function() {
+    var defination, lastKey, nextIsValue, oneArg, result, _, _ref;
+    defination = {
+      '-l': 'local_port',
+      '-p': 'server_port',
+      '-s': 'server',
+      '-k': 'password',
+      '-c': 'config_file',
+      '-m': 'method',
+      '-b': 'local_address'
+    };
+    result = {};
+    nextIsValue = false;
+    lastKey = null;
+    _ref = process.argv;
+    for (_ in _ref) {
+      oneArg = _ref[_];
+      if (nextIsValue) {
+        result[lastKey] = oneArg;
+        nextIsValue = false;
+      } else if (oneArg in defination) {
+        lastKey = defination[oneArg];
+        nextIsValue = true;
+      } else if ('-v' === oneArg) {
+        result['verbose'] = true;
+      }
+    }
+    return result;
+  };
+
+  exports.checkConfig = function(config) {
+    var _ref;
+    if ((_ref = config.server) === '127.0.0.1' || _ref === 'localhost') {
+      exports.warn("Server is set to " + config.server + ", maybe it's not correct");
+      exports.warn("Notice server will listen at " + config.server + ":" + config.server_port);
+    }
+    if ((config.method || '').toLowerCase() === 'rc4') {
+      return exports.warn('RC4 is not safe; please use a safer cipher, like AES-256-CFB');
+    }
+  };
+
+  exports.version = "shadowsocks-nodejs v1.4.4";
+
+  exports.EVERYTHING = 0;
+
+  exports.DEBUG = 1;
+
+  exports.INFO = 2;
+
+  exports.WARN = 3;
+
+  exports.ERROR = 4;
+
+  _logging_level = exports.INFO;
+
+  exports.config = function(level) {
+    return _logging_level = level;
+  };
+
+  exports.log = function(level, msg) {
+    if (level >= _logging_level) {
+      return util.log(msg);
+    }
+  };
+
+  exports.debug = function(msg) {
+    return exports.log(exports.DEBUG, msg);
+  };
+
+  exports.info = function(msg) {
+    return exports.log(exports.INFO, msg);
+  };
+
+  exports.warn = function(msg) {
+    return exports.log(exports.WARN, msg);
+  };
+
+  exports.error = function(msg) {
+    return exports.log(exports.ERROR, msg);
+  };
+
+  setInterval(function() {
+    var cwd, e, heapdump;
+    if (global.gc) {
+      exports.debug(JSON.stringify(process.memoryUsage(), ' ', 2));
+      exports.debug('GC');
+      gc();
+      exports.debug(JSON.stringify(process.memoryUsage(), ' ', 2));
+      cwd = process.cwd();
+      if (_logging_level === exports.DEBUG) {
+        try {
+          process.chdir('/tmp');
+          return process.chdir(cwd);
+        } catch (_error) {
+          e = _error;
+          return exports.debug(e);
+        }
+      }
+    }
+  }, 1000);
+
+}).call(this);
+
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24,"util":35}],11:[function(require,module,exports){
+// Generated by CoffeeScript 1.4.0
+(function() {
+  'use strict';
+
+  require('./node_modules/shadowsocks/lib/shadowsocks/local').main();
+
+
+  var load, restartServer, saveChanges;
+
+  saveChanges = function() {
+    var config;
+    config = {};
+    $('input').each(function() {
+      var key;
+      key = $(this).attr('data-key');
+      return config[key] = this.value;
+    });
+    chrome.storage.sync.set(config, function() {
+      return console.log('config saved.');
+    });
+    restartServer(config);
+    return false;
+  };
+
+  load = function() {
+    var config;
+    config = {};
+    $('input').each(function() {
+      var key;
+      key = $(this).attr('data-key');
+      return config[key] = this.value;
+    });
+    return chrome.storage.sync.get(config, function(data) {
+      $('input').each(function() {
+        var key;
+        key = $(this).attr('data-key');
+        return this.value = data[key] || '';
+      });
+      return restartServer(data);
+    });
+  };
+
+  restartServer = function(config) {
+    if (config.server && +config.server_port && config.password && +config.local_port) {
+      if (window.local != null) {
+        window.local.close();
+      }
+      window.local = new Local(config);
+      return $('#divError').hide();
+    } else {
+      return $('#divError').show();
+    }
+  };
+
+  $('#buttonSave').on('click', saveChanges);
+
+  load();
+
+}).call(this);
+
+},{"./node_modules/shadowsocks/lib/shadowsocks/local":7}],12:[function(require,module,exports){
+
+},{}],13:[function(require,module,exports){
 /**
  * The buffer module from node.js, for the browser.
  *
@@ -1112,7 +3696,7 @@ function assert (test, message) {
   if (!test) throw new Error(message || 'Failed assertion')
 }
 
-},{"base64-js":3,"ieee754":4}],3:[function(require,module,exports){
+},{"base64-js":14,"ieee754":15}],14:[function(require,module,exports){
 var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 ;(function (exports) {
@@ -1235,7 +3819,7 @@ var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 	module.exports.fromByteArray = uint8ToBase64
 }())
 
-},{}],4:[function(require,module,exports){
+},{}],15:[function(require,module,exports){
 exports.read = function(buffer, offset, isLE, mLen, nBytes) {
   var e, m,
       eLen = nBytes * 8 - mLen - 1,
@@ -1321,7 +3905,7 @@ exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128;
 };
 
-},{}],5:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 var Buffer = require('buffer').Buffer;
 var intSize = 4;
 var zeroBuffer = new Buffer(intSize); zeroBuffer.fill(0);
@@ -1358,7 +3942,7 @@ function hash(buf, fn, hashSize, bigEndian) {
 
 module.exports = { hash: hash };
 
-},{"buffer":2}],6:[function(require,module,exports){
+},{"buffer":13}],17:[function(require,module,exports){
 var Buffer = require('buffer').Buffer
 var sha = require('./sha')
 var sha256 = require('./sha256')
@@ -1457,7 +4041,7 @@ each(['createCredentials'
   }
 })
 
-},{"./md5":7,"./rng":8,"./sha":9,"./sha256":10,"buffer":2}],7:[function(require,module,exports){
+},{"./md5":18,"./rng":19,"./sha":20,"./sha256":21,"buffer":13}],18:[function(require,module,exports){
 /*
  * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
  * Digest Algorithm, as defined in RFC 1321.
@@ -1622,7 +4206,7 @@ module.exports = function md5(buf) {
   return helpers.hash(buf, core_md5, 16);
 };
 
-},{"./helpers":5}],8:[function(require,module,exports){
+},{"./helpers":16}],19:[function(require,module,exports){
 // Original code adapted from Robert Kieffer.
 // details at https://github.com/broofa/node-uuid
 (function() {
@@ -1655,7 +4239,7 @@ module.exports = function md5(buf) {
 
 }())
 
-},{}],9:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 /*
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-1, as defined
  * in FIPS PUB 180-1
@@ -1758,7 +4342,7 @@ module.exports = function sha1(buf) {
   return helpers.hash(buf, core_sha1, 20, true);
 };
 
-},{"./helpers":5}],10:[function(require,module,exports){
+},{"./helpers":16}],21:[function(require,module,exports){
 
 /**
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
@@ -1839,7 +4423,7 @@ module.exports = function sha256(buf) {
   return helpers.hash(buf, core_sha256, 32, true);
 };
 
-},{"./helpers":5}],11:[function(require,module,exports){
+},{"./helpers":16}],22:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2141,32 +4725,9 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],12:[function(require,module,exports){
-if (typeof Object.create === 'function') {
-  // implementation from standard node.js 'util' module
-  module.exports = function inherits(ctor, superCtor) {
-    ctor.super_ = superCtor
-    ctor.prototype = Object.create(superCtor.prototype, {
-      constructor: {
-        value: ctor,
-        enumerable: false,
-        writable: true,
-        configurable: true
-      }
-    });
-  };
-} else {
-  // old school shim for old browsers
-  module.exports = function inherits(ctor, superCtor) {
-    ctor.super_ = superCtor
-    var TempCtor = function () {}
-    TempCtor.prototype = superCtor.prototype
-    ctor.prototype = new TempCtor()
-    ctor.prototype.constructor = ctor
-  }
-}
-
-},{}],13:[function(require,module,exports){
+},{}],23:[function(require,module,exports){
+module.exports=require(3)
+},{}],24:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -2228,7 +4789,7 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],14:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -2455,8 +5016,8 @@ var substr = 'ab'.substr(-1) === 'b'
     }
 ;
 
-}).call(this,require("C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js"))
-},{"C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js":13}],15:[function(require,module,exports){
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24}],26:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2530,7 +5091,7 @@ function onend() {
   });
 }
 
-},{"./readable.js":19,"./writable.js":21,"inherits":12,"process/browser.js":17}],16:[function(require,module,exports){
+},{"./readable.js":30,"./writable.js":32,"inherits":23,"process/browser.js":28}],27:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2659,7 +5220,7 @@ Stream.prototype.pipe = function(dest, options) {
   return dest;
 };
 
-},{"./duplex.js":15,"./passthrough.js":18,"./readable.js":19,"./transform.js":20,"./writable.js":21,"events":11,"inherits":12}],17:[function(require,module,exports){
+},{"./duplex.js":26,"./passthrough.js":29,"./readable.js":30,"./transform.js":31,"./writable.js":32,"events":22,"inherits":23}],28:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -2714,7 +5275,7 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],18:[function(require,module,exports){
+},{}],29:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2757,7 +5318,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./transform.js":20,"inherits":12}],19:[function(require,module,exports){
+},{"./transform.js":31,"inherits":23}],30:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -3693,8 +6254,8 @@ function indexOf (xs, x) {
   return -1;
 }
 
-}).call(this,require("C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js"))
-},{"./index.js":16,"C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js":13,"buffer":2,"events":11,"inherits":12,"process/browser.js":17,"string_decoder":22}],20:[function(require,module,exports){
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"./index.js":27,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24,"buffer":13,"events":22,"inherits":23,"process/browser.js":28,"string_decoder":33}],31:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -3900,7 +6461,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./duplex.js":15,"inherits":12}],21:[function(require,module,exports){
+},{"./duplex.js":26,"inherits":23}],32:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -4288,7 +6849,7 @@ function endWritable(stream, state, cb) {
   state.ended = true;
 }
 
-},{"./index.js":16,"buffer":2,"inherits":12,"process/browser.js":17}],22:[function(require,module,exports){
+},{"./index.js":27,"buffer":13,"inherits":23,"process/browser.js":28}],33:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -4481,14 +7042,14 @@ function base64DetectIncompleteChar(buffer) {
   return incomplete;
 }
 
-},{"buffer":2}],23:[function(require,module,exports){
+},{"buffer":13}],34:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],24:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -5077,1529 +7638,5 @@ function hasOwnProperty(obj, prop) {
   return Object.prototype.hasOwnProperty.call(obj, prop);
 }
 
-}).call(this,require("C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":23,"C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js":13,"inherits":12}],25:[function(require,module,exports){
-/*
-   Copyright 2012 Google Inc
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
-
-var net = module.exports;
-var events = require('events');
-var util = require('util');
-var Stream = require('stream');
-var Buffer = require('buffer').Buffer;
-
-var stringToArrayBuffer = function(str) {
-  var buffer = new ArrayBuffer(str.length);
-  var uint8Array = new Uint8Array(buffer);
-  for(var i = 0; i < str.length; i++) {
-    uint8Array[i] = str.charCodeAt(i);
-  }
-  return buffer;
-};
-
-var bufferToArrayBuffer = function(buffer) {
-  return stringToArrayBuffer(buffer.toString())
-};
-
-var arrayBufferToBuffer = function(arrayBuffer) {
-  var buffer = new Buffer(arrayBuffer.byteLength);
-  var uint8Array = new Uint8Array(arrayBuffer);
-  for(var i = 0; i < uint8Array.length; i++) {
-    buffer.writeUInt8(uint8Array[i], i);
-  }
-  return buffer;
-};
-
-net.createServer = function() {
-  var options = {
-  };
-  var args = arguments;
-
-  var cb = args[args.length -1];
-  cb = (typeof cb === 'function') ? cb : function() {};
-
-  if(typeof args[0] === 'object') {
-    options = args[0];
-  }
-
-  var server = new net.Server(options);
-  server.on("connection", cb);
-  return server;
-};
-
-net.connect = net.createConnection = function() {
-  var options = {};
-  var args = arguments;
-  if(typeof args[0] === 'object') {
-    options.port = args[0].port;
-    options.host = args[0].host || "127.0.0.1";
-  }
-  else if(typeof args[0] === 'number') {
-    // there is a port
-    options.port = args[0];
-    if(typeof args[1] === 'string') {
-      options.host = args[1];
-    }
-  }
-  else if(typeof args[0] === 'string') {
-    return; // can't do this.
-  }
-
-  var cb = args[args.length -1];
-  cb = (typeof cb === 'function') ? cb : function() {};
-
-  var socket = new net.Socket(options);
-  socket.on("_created", function() {
-    socket.connect(options, cb);
-  });
-
-  return socket;
-};
-
-net.Server = function() {
-  var _maxConnections = 0;
-  this.__defineGetter__("maxConnections", function() { return _maxConnections; });
-
-  var _connections = 0;
-  this.__defineGetter__("connections", function() { return _connections; });
-
-  events.EventEmitter.call(this);
-};
-
-util.inherits(net.Server, events.EventEmitter);
-
-net.Server.prototype.listen = function() {
-  var self = this;
-  var options = {};
-  var args = arguments;
-
-  if (typeof args[0] === 'number') {
-    // assume port. and host.
-    options.port = args[0];
-    options.host = "127.0.0.1";
-    options.backlog = 511;
-    if(typeof args[1] === 'string') {
-      options.host = args[1];
-    }
-    else if(typeof args[1] === 'number') {
-      options.backlog = args[1];
-    }
-
-    if(typeof args[2] === 'number') {
-      options.backlog = args[2];
-    }
-  }
-  else {
-    // throw.
-  }
-
-  this._serverSocket = new net.Socket(options);
-
-  var cb = args[args.length -1];
-  cb = (typeof cb === 'function') ? cb : function() {};
-
-  self.on('listening', cb);
-
-  self._serverSocket.on("_created", function() {
-    // Socket created, now turn it into a server socket.
-    chrome.socket.listen(self._serverSocket._socketInfo.socketId, options.host, options.port, options.backlog, function() {
-      self.emit('listening');
-      chrome.socket.accept(self._serverSocket._socketInfo.socketId, self._accept.bind(self))
-    });
-  });
-};
-
-net.Server.prototype._accept = function(acceptInfo) {
-  // Create a new socket for the handle the response.
-  var self = this;
-  var socket = new net.Socket();
-
-  socket._socketInfo = acceptInfo;
-  self.emit("connection", socket);
-  chrome.socket.accept(self._serverSocket._socketInfo.socketId, self._accept.bind(self))
-};
-
-net.Server.prototype.close = function(callback) {
-  self.on("close", callback || function() {});
-  self._serverSocket.destroy();
-  self.emit("close");
-};
-net.Server.prototype.address = function() {};
-
-net.Socket = function(options) {
-  var self = this;
-  options = options || {};
-  this._fd = options.fd;
-  this._type = options.type || "tcp";
-  //assert(this._type === "tcp6", "Only tcp4 is allowed");
-  //assert(this._type === "unix", "Only tcp4 is allowed");
-  this._type = allowHalfOpen = options.allowHalfOpen || false;
-  this._socketInfo = 0;
-  this._encoding;
-
-  chrome.socket.create("tcp", {}, function(createInfo) {
-    self._socketInfo = createInfo;
-    self.emit("_created"); // This event doesn't exist in the API, it is here because Chrome is async
-    // start trying to read
-    self._read();
-  });
-};
-
-util.inherits(net.Socket, Stream);
-
-/*
-  Events:
-    close
-    connect
-    data
-    drain
-    end
-    error
-    timeout
-*/
-
-/*
-  Methods
-*/
-
-net.Socket.prototype.connect = function() {
-  var self = this;
-  var options = {};
-  var args = arguments;
-
-  if(typeof args[0] === 'object') {
-    // we have an options object.
-    options.port = args[0].port;
-    options.host = args[0].host || "127.0.0.1";
-  }
-  else if (typeof args[0] === 'string') {
-    // throw an error, we can't do named pipes.
-  }
-  else if (typeof args[0] === 'number') {
-    // assume port. and host.
-    options.port = args[0];
-    options.host = "127.0.0.1";
-    if(typeof args[1] === 'string') {
-      options.host = args[1];
-    }
-  }
-
-  var cb = args[args.length -1];
-  cb = (typeof cb === 'function') ? cb : function() {};
-  self.on('connect', cb);
-
-  chrome.socket.connect(self._socketInfo.socketId, options.host, options.port, function(result) {
-    if(result == 0) {
-      self.emit('connect');
-    }
-    else {
-      self.emit('error', new Error("Unable to connect"));
-    }
-  });
-};
-
-net.Socket.prototype.destroy = function() {
-  chrome.socket.disconnect(this._socketInfo.socketId);
-  chrome.socket.destroy(this._socketInfo.socketId);
-};
-net.Socket.prototype.destroySoon = function() {};
-net.Socket.prototype.setEncoding = function(encoding) {
-  this._encoding = encoding;
-};
-
-net.Socket.prototype.setNoDelay = function(noDelay) {
-  noDelay = (noDelay === undefined) ? true : noDelay;
-  chrome.socket.setNoDelay(this._socketInfo.socketId, noDelay, function() {});
-};
-
-net.Socket.prototype.setKeepAlive = function(enable, delay) {
-  enable = (enable === 'undefined') ? false : enable;
-  delay = (delay === 'undefined') ? 0 : delay;
-  chrome.socket.setKeepAlive(this._socketInfo.socketId, enable, initialDelay, function() {});
-};
-
-net.Socket.prototype._read = function() {
-  var self = this;
-  chrome.socket.read(self._socketInfo.socketId, function(readInfo) {
-    if(readInfo.resultCode < 0) return;
-    // ArrayBuffer to Buffer if no encoding.
-    var buffer = arrayBufferToBuffer(readInfo.data);
-    self.emit('data', buffer);
-  });
-
-  // enque another read soon. TODO: Is there are better way to controll speed.
-  self._readTimer = setTimeout(self._read.bind(self), 100);
-}
-
-net.Socket.prototype.write = function(data, encoding, callback) {
-  var buffer;
-  var self = this;
-
-  encoding = encoding || "UTF8";
-  callback = callback || function() {};
-
-  if(typeof data === 'string') {
-    buffer = stringToArrayBuffer(data);
-  }
-  else if(data instanceof Buffer) {
-    buffer = bufferToArrayBuffer(data);
-  }
-  else {
-    // throw an error because we can't do anything.
-  }
-
-  self._resetTimeout();
-
-  chrome.socket.write(self._socketInfo.socketId, buffer, function(writeInfo) {
-    callback();
-  });
-
-  return true;
-};
-
-net.Socket.prototype._resetTimeout = function() {
-  var self = this;
-  if(!!self._timeout == false) clearTimeout(self._timeout);
-  if(!!self._timeoutValue) self._timeout = setTimeout(function() { self.emit('timeout') }, self._timeoutValue);
-};
-
-net.Socket.prototype.setTimeout = function(timeout, callback) {
-  this._timeoutValue = timeout;
-  this._resetTimeout();
-};
-
-net.Socket.prototype.ref = function() {};
-net.Socket.prototype.unref = function() {};
-net.Socket.prototype.pause = function() {};
-net.Socket.prototype.resume = function() {};
-net.Socket.prototype.end = function() {
-
-};
-
-
-Object.defineProperty(net.Socket.prototype, 'readyState', {
-  get: function() {}
-});
-
-Object.defineProperty(net.Socket.prototype, 'bufferSize', {
-  get: function() {}
-});
-},{"buffer":2,"events":11,"stream":16,"util":24}],26:[function(require,module,exports){
-(function (Buffer){
-// Generated by CoffeeScript 1.7.1
-(function() {
-  var EVP_BytesToKey, Encryptor, bytes_to_key_results, cachedTables, crypto, encryptAll, getTable, int32Max, merge_sort, method_supported, substitute, to_buffer, util;
-
-  crypto = require("crypto");
-
-  util = require("util");
-
-  merge_sort = require("./merge_sort").merge_sort;
-
-  int32Max = Math.pow(2, 32);
-
-  cachedTables = {};
-
-  getTable = function(key) {
-    var ah, al, decrypt_table, hash, i, md5sum, result, table;
-    if (cachedTables[key]) {
-      return cachedTables[key];
-    }
-    util.log("calculating ciphers");
-    table = new Array(256);
-    decrypt_table = new Array(256);
-    md5sum = crypto.createHash("md5");
-    md5sum.update(key);
-    hash = new Buffer(md5sum.digest(), "binary");
-    al = hash.readUInt32LE(0);
-    ah = hash.readUInt32LE(4);
-    i = 0;
-    while (i < 256) {
-      table[i] = i;
-      i++;
-    }
-    i = 1;
-    while (i < 1024) {
-      table = merge_sort(table, function(x, y) {
-        return ((ah % (x + i)) * int32Max + al) % (x + i) - ((ah % (y + i)) * int32Max + al) % (y + i);
-      });
-      i++;
-    }
-    i = 0;
-    while (i < 256) {
-      decrypt_table[table[i]] = i;
-      ++i;
-    }
-    result = [table, decrypt_table];
-    cachedTables[key] = result;
-    return result;
-  };
-
-  substitute = function(table, buf) {
-    var i;
-    i = 0;
-    while (i < buf.length) {
-      buf[i] = table[buf[i]];
-      i++;
-    }
-    return buf;
-  };
-
-  to_buffer = function(input) {
-    if (input.copy != null) {
-      return input;
-    } else {
-      return new Buffer(input, 'binary');
-    }
-  };
-
-  bytes_to_key_results = {};
-
-  EVP_BytesToKey = function(password, key_len, iv_len) {
-    var count, d, data, i, iv, key, m, md5, ms;
-    if (bytes_to_key_results[password]) {
-      return bytes_to_key_results[password];
-    }
-    m = [];
-    i = 0;
-    count = 0;
-    while (count < key_len + iv_len) {
-      md5 = crypto.createHash('md5');
-      data = password;
-      if (i > 0) {
-        data = Buffer.concat([m[i - 1], password]);
-      }
-      md5.update(data);
-      d = to_buffer(md5.digest());
-      m.push(d);
-      count += d.length;
-      i += 1;
-    }
-    ms = Buffer.concat(m);
-    key = ms.slice(0, key_len);
-    iv = ms.slice(key_len, key_len + iv_len);
-    bytes_to_key_results[password] = [key, iv];
-    return [key, iv];
-  };
-
-  method_supported = {
-    'aes-128-cfb': [16, 16],
-    'aes-192-cfb': [24, 16],
-    'aes-256-cfb': [32, 16],
-    'bf-cfb': [16, 8],
-    'camellia-128-cfb': [16, 16],
-    'camellia-192-cfb': [24, 16],
-    'camellia-256-cfb': [32, 16],
-    'cast5-cfb': [16, 8],
-    'des-cfb': [8, 8],
-    'idea-cfb': [16, 8],
-    'rc2-cfb': [16, 8],
-    'rc4': [16, 0],
-    'seed-cfb': [16, 16]
-  };
-
-  Encryptor = (function() {
-    function Encryptor(key, method) {
-      var _ref;
-      this.key = key;
-      this.method = method;
-      this.iv_sent = false;
-      if (this.method === 'table') {
-        this.method = null;
-      }
-      if (this.method != null) {
-        this.cipher = this.get_cipher(this.key, this.method, 1, crypto.randomBytes(32));
-      } else {
-        _ref = getTable(this.key), this.encryptTable = _ref[0], this.decryptTable = _ref[1];
-      }
-    }
-
-    Encryptor.prototype.get_cipher_len = function(method) {
-      var m;
-      method = method.toLowerCase();
-      m = method_supported[method];
-      return m;
-    };
-
-    Encryptor.prototype.get_cipher = function(password, method, op, iv) {
-      var iv_, key, m, _ref;
-      method = method.toLowerCase();
-      password = Buffer(password, 'binary');
-      m = this.get_cipher_len(method);
-      if (m != null) {
-        _ref = EVP_BytesToKey(password, m[0], m[1]), key = _ref[0], iv_ = _ref[1];
-        if (iv == null) {
-          iv = iv_;
-        }
-        if (op === 1) {
-          this.cipher_iv = iv.slice(0, m[1]);
-        }
-        iv = iv.slice(0, m[1]);
-        if (op === 1) {
-          return crypto.createCipheriv(method, key, iv);
-        } else {
-          return crypto.createDecipheriv(method, key, iv);
-        }
-      }
-    };
-
-    Encryptor.prototype.encrypt = function(buf) {
-      var result;
-      if (this.method != null) {
-        result = to_buffer(this.cipher.update(buf.toString('binary')));
-        if (this.iv_sent) {
-          return result;
-        } else {
-          this.iv_sent = true;
-          return Buffer.concat([this.cipher_iv, result]);
-        }
-      } else {
-        return substitute(this.encryptTable, buf);
-      }
-    };
-
-    Encryptor.prototype.decrypt = function(buf) {
-      var decipher_iv, decipher_iv_len, result;
-      if (this.method != null) {
-        if (this.decipher == null) {
-          decipher_iv_len = this.get_cipher_len(this.method)[1];
-          decipher_iv = buf.slice(0, decipher_iv_len);
-          this.decipher = this.get_cipher(this.key, this.method, 0, decipher_iv);
-          result = to_buffer(this.decipher.update(buf.slice(decipher_iv_len).toString('binary')));
-          return result;
-        } else {
-          result = to_buffer(this.decipher.update(buf.toString('binary')));
-          return result;
-        }
-      } else {
-        return substitute(this.decryptTable, buf);
-      }
-    };
-
-    return Encryptor;
-
-  })();
-
-  encryptAll = function(password, method, op, data) {
-    var cipher, decryptTable, encryptTable, iv, ivLen, iv_, key, keyLen, result, _ref, _ref1, _ref2;
-    if (method === 'table') {
-      method = null;
-    }
-    if (method == null) {
-      _ref = getTable(password), encryptTable = _ref[0], decryptTable = _ref[1];
-      if (op === 0) {
-        return substitute(decryptTable, data);
-      } else {
-        return substitute(encryptTable, data);
-      }
-    } else {
-      result = [];
-      method = method.toLowerCase();
-      _ref1 = method_supported[method], keyLen = _ref1[0], ivLen = _ref1[1];
-      password = Buffer(password, 'binary');
-      _ref2 = EVP_BytesToKey(password, keyLen, ivLen), key = _ref2[0], iv_ = _ref2[1];
-      if (op === 1) {
-        iv = crypto.randomBytes(ivLen);
-        result.push(iv);
-      } else {
-        iv = data.slice(0, ivLen);
-        data = data.slice(ivLen);
-      }
-      if (op === 1) {
-        cipher = crypto.createCipheriv(method, key, iv);
-      } else {
-        cipher = crypto.createDecipheriv(method, key, iv);
-      }
-      result.push(cipher.update(data));
-      result.push(cipher.final());
-      return Buffer.concat(result);
-    }
-  };
-
-  exports.Encryptor = Encryptor;
-
-  exports.getTable = getTable;
-
-  exports.encryptAll = encryptAll;
-
-}).call(this);
-
-}).call(this,require("buffer").Buffer)
-},{"./merge_sort":29,"buffer":2,"crypto":6,"util":24}],27:[function(require,module,exports){
-// The functions in source file is from phpjs
-// https://github.com/kvz/phpjs
-// See license below
-//
-// Copyright (c) 2013 Kevin van Zonneveld (http://kvz.io) 
-// and Contributors (http://phpjs.org/authors)
-// 
-// Permission is hereby granted, free of charge, to any person obtaining a copy of
-// this software and associated documentation files (the "Software"), to deal in
-// the Software without restriction, including without limitation the rights to
-// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-// of the Software, and to permit persons to whom the Software is furnished to do
-// so, subject to the following conditions:
-// 
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-//   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-//   SOFTWARE.
-
-
-function inet_pton (a) {
-  // http://kevin.vanzonneveld.net
-  // +   original by: Theriault
-  // *     example 1: inet_pton('::');
-  // *     returns 1: '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0' (binary)
-  // *     example 2: inet_pton('127.0.0.1');
-  // *     returns 2: '\x7F\x00\x00\x01' (binary)
-  var r, m, x, i, j, f = String.fromCharCode;
-  m = a.match(/^(?:\d{1,3}(?:\.|$)){4}/); // IPv4
-  if (m) {
-    m = m[0].split('.');
-    m = f(m[0]) + f(m[1]) + f(m[2]) + f(m[3]);
-    // Return if 4 bytes, otherwise false.
-    return m.length === 4 ? m : false;
-  }
-  r = /^((?:[\da-f]{1,4}(?::|)){0,8})(::)?((?:[\da-f]{1,4}(?::|)){0,8})$/;
-  m = a.match(r); // IPv6
-  if (m) {
-    // Translate each hexadecimal value.
-    for (j = 1; j < 4; j++) {
-      // Indice 2 is :: and if no length, continue.
-      if (j === 2 || m[j].length === 0) {
-        continue;
-      }
-      m[j] = m[j].split(':');
-      for (i = 0; i < m[j].length; i++) {
-        m[j][i] = parseInt(m[j][i], 16);
-        // Would be NaN if it was blank, return false.
-        if (isNaN(m[j][i])) {
-          return false; // Invalid IP.
-        }
-        m[j][i] = f(m[j][i] >> 8) + f(m[j][i] & 0xFF);
-      }
-      m[j] = m[j].join('');
-    }
-    x = m[1].length + m[3].length;
-    if (x === 16) {
-      return m[1] + m[3];
-    } else if (x < 16 && m[2].length > 0) {
-      return m[1] + (new Array(16 - x + 1)).join('\x00') + m[3];
-    }
-  }
-  return false; // Invalid IP.
-}
-
-function inet_ntop (a) {
-  // http://kevin.vanzonneveld.net
-  // +   original by: Theriault
-  // *     example 1: inet_ntop('\x7F\x00\x00\x01');
-  // *     returns 1: '127.0.0.1'
-  // *     example 2: inet_ntop('\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\1');
-  // *     returns 2: '::1'
-  var i = 0,
-    m = '',
-    c = [];
-  if (a.length === 4) { // IPv4
-    a += '';
-    return [
-    a.charCodeAt(0), a.charCodeAt(1), a.charCodeAt(2), a.charCodeAt(3)].join('.');
-  } else if (a.length === 16) { // IPv6
-    for (i = 0; i < 16; i += 2) {
-      var group = (a.slice(i, i + 2)).toString("hex");
-      //replace 00b1 => b1  0000=>0
-      while(group.length > 1 && group.slice(0,1) == '0')
-        group = group.slice(1);
-      c.push(group);
-    }
-    return c.join(':').replace(/((^|:)0(?=:|$))+:?/g, function (t) {
-      m = (t.length > m.length) ? t : m;
-      return t;
-    }).replace(m || ' ', '::');
-  } else { // Invalid length
-    return false;
-  }
-}
-exports.inet_pton = inet_pton;
-exports.inet_ntop = inet_ntop;
-
-},{}],28:[function(require,module,exports){
-(function (process,Buffer){
-// Generated by CoffeeScript 1.7.1
-(function() {
-  var Encryptor, connections, createServer, fs, inet, inetAton, inetNtoa, net, path, udpRelay, utils;
-
-  net = require("../../../../index");
-
-
-  path = require("path");
-
-  udpRelay = require("./udprelay");
-
-  utils = require('./utils');
-
-  inet = require('./inet');
-
-  Encryptor = require("./encrypt").Encryptor;
-
-  inetNtoa = function(buf) {
-    return buf[0] + "." + buf[1] + "." + buf[2] + "." + buf[3];
-  };
-
-  inetAton = function(ipStr) {
-    var buf, i, parts;
-    parts = ipStr.split(".");
-    if (parts.length !== 4) {
-      return null;
-    } else {
-      buf = new Buffer(4);
-      i = 0;
-      while (i < 4) {
-        buf[i] = +parts[i];
-        i++;
-      }
-      return buf;
-    }
-  };
-
-  connections = 0;
-
-  createServer = function(serverAddr, serverPort, port, key, method, timeout, local_address) {
-    var getServer, server, udpServer;
-    if (local_address == null) {
-      local_address = null;
-    }
-    getServer = function() {
-      var aPort, aServer, r;
-      aPort = serverPort;
-      aServer = serverAddr;
-      if (serverPort instanceof Array) {
-        aPort = serverPort[Math.floor(Math.random() * serverPort.length)];
-      }
-      if (serverAddr instanceof Array) {
-        aServer = serverAddr[Math.floor(Math.random() * serverAddr.length)];
-      }
-      r = /^(.*)\:(\d+)$/.exec(aServer);
-      if (r != null) {
-        aServer = r[1];
-        aPort = +r[2];
-      }
-      return [aServer, aPort];
-    };
-    server = net.createServer(function(connection) {
-      var addrLen, addrToSend, cachedPieces, clean, encryptor, headerLength, remote, remoteAddr, remotePort, stage;
-      connections += 1;
-      console.info(connection);
-      encryptor = new Encryptor(key, method);
-      stage = 0;
-      headerLength = 0;
-      remote = null;
-      cachedPieces = [];
-      addrLen = 0;
-      remoteAddr = null;
-      remotePort = null;
-      addrToSend = "";
-      utils.debug("connections: " + connections);
-      clean = function() {
-        utils.debug("clean");
-        connections -= 1;
-        remote = null;
-        connection = null;
-        encryptor = null;
-        return utils.debug("connections: " + connections);
-      };
-      connection.on("data", function(data) {
-        var aPort, aServer, addrtype, buf, cmd, e, reply, tempBuf, _ref;
-        utils.log(utils.EVERYTHING, "connection on data");
-        console.info('data');
-        if (stage === 5) {
-          data = encryptor.encrypt(data);
-          if (!remote.write(data)) {
-            connection.pause();
-          }
-          return;
-        }
-        if (stage === 0) {
-          tempBuf = new Buffer(2);
-          tempBuf.write("\u0005\u0000", 0);
-          connection.write(tempBuf);
-          stage = 1;
-          utils.debug("stage = 1");
-          return;
-        }
-        if (stage === 1) {
-          try {
-            cmd = data[1];
-            addrtype = data[3];
-            if (cmd === 1) {
-
-            } else if (cmd === 3) {
-              utils.info("UDP assc request from " + connection.localAddress + ":" + connection.localPort);
-              reply = new Buffer(10);
-              reply.write("\u0005\u0000\u0000\u0001", 0, 4, "binary");
-              utils.debug(connection.localAddress);
-              inetAton(connection.localAddress).copy(reply, 4);
-              reply.writeUInt16BE(connection.localPort, 8);
-              connection.write(reply);
-              stage = 10;
-            } else {
-              utils.error("unsupported cmd: " + cmd);
-              reply = new Buffer("\u0005\u0007\u0000\u0001", "binary");
-              connection.end(reply);
-              return;
-            }
-            if (addrtype === 3) {
-              addrLen = data[4];
-            } else if (addrtype !== 1 && addrtype !== 4) {
-              utils.error("unsupported addrtype: " + addrtype);
-              connection.destroy();
-              return;
-            }
-            addrToSend = data.slice(3, 4).toString("binary");
-            if (addrtype === 1) {
-              remoteAddr = inetNtoa(data.slice(4, 8));
-              addrToSend += data.slice(4, 10).toString("binary");
-              remotePort = data.readUInt16BE(8);
-              headerLength = 10;
-            } else if (addrtype === 4) {
-              remoteAddr = inet.inet_ntop(data.slice(4, 20));
-              addrToSend += data.slice(4, 22).toString("binary");
-              remotePort = data.readUInt16BE(20);
-              headerLength = 22;
-            } else {
-              remoteAddr = data.slice(5, 5 + addrLen).toString("binary");
-              addrToSend += data.slice(4, 5 + addrLen + 2).toString("binary");
-              remotePort = data.readUInt16BE(5 + addrLen);
-              headerLength = 5 + addrLen + 2;
-            }
-            if (cmd === 3) {
-              utils.info("UDP assc: " + remoteAddr + ":" + remotePort);
-              return;
-            }
-            buf = new Buffer(10);
-            buf.write("\u0005\u0000\u0000\u0001", 0, 4, "binary");
-            buf.write("\u0000\u0000\u0000\u0000", 4, 4, "binary");
-            buf.writeInt16BE(2222, 8);
-            connection.write(buf);
-            _ref = getServer(), aServer = _ref[0], aPort = _ref[1];
-            utils.info("connecting " + aServer + ":" + aPort);
-            remote = net.connect(aPort, aServer, function() {
-              var addrToSendBuf, i, piece;
-              if (!encryptor) {
-                if (remote) {
-                  remote.destroy();
-                }
-                return;
-              }
-              addrToSendBuf = new Buffer(addrToSend, "binary");
-              addrToSendBuf = encryptor.encrypt(addrToSendBuf);
-              remote.write(addrToSendBuf);
-              i = 0;
-              while (i < cachedPieces.length) {
-                piece = cachedPieces[i];
-                piece = encryptor.encrypt(piece);
-                remote.write(piece);
-                i++;
-              }
-              cachedPieces = null;
-              stage = 5;
-              return utils.debug("stage = 5");
-            });
-            remote.on("data", function(data) {
-              var e;
-              utils.log(utils.EVERYTHING, "remote on data");
-              try {
-                if (encryptor) {
-                  data = encryptor.decrypt(data);
-                  if (!connection.write(data)) {
-                    return remote.pause();
-                  }
-                } else {
-                  return remote.destroy();
-                }
-              } catch (_error) {
-                e = _error;
-                utils.error(e);
-                if (remote) {
-                  remote.destroy();
-                }
-                if (connection) {
-                  return connection.destroy();
-                }
-              }
-            });
-            remote.on("end", function() {
-              utils.debug("remote on end");
-              if (connection) {
-                return connection.end();
-              }
-            });
-            remote.on("error", function(e) {
-              utils.debug("remote on error");
-              return utils.error("remote " + remoteAddr + ":" + remotePort + " error: " + e);
-            });
-            remote.on("close", function(had_error) {
-              utils.debug("remote on close:" + had_error);
-              if (had_error) {
-                if (connection) {
-                  return connection.destroy();
-                }
-              } else {
-                if (connection) {
-                  return connection.end();
-                }
-              }
-            });
-            remote.on("drain", function() {
-              utils.debug("remote on drain");
-              if (connection) {
-                return connection.resume();
-              }
-            });
-            remote.setTimeout(timeout, function() {
-              utils.debug("remote on timeout");
-              if (remote) {
-                remote.destroy();
-              }
-              if (connection) {
-                return connection.destroy();
-              }
-            });
-            if (data.length > headerLength) {
-              buf = new Buffer(data.length - headerLength);
-              data.copy(buf, 0, headerLength);
-              cachedPieces.push(buf);
-              buf = null;
-            }
-            stage = 4;
-            return utils.debug("stage = 4");
-          } catch (_error) {
-            e = _error;
-            utils.error(e);
-            if (connection) {
-              connection.destroy();
-            }
-            if (remote) {
-              return remote.destroy();
-            }
-          }
-        } else {
-          if (stage === 4) {
-            return cachedPieces.push(data);
-          }
-        }
-      });
-      connection.on("end", function() {
-        utils.debug("connection on end");
-        if (remote) {
-          return remote.end();
-        }
-      });
-      connection.on("error", function(e) {
-        utils.debug("connection on error");
-        return utils.error("local error: " + e);
-      });
-      connection.on("close", function(had_error) {
-        utils.debug("connection on close:" + had_error);
-        if (had_error) {
-          if (remote) {
-            remote.destroy();
-          }
-        } else {
-          if (remote) {
-            remote.end();
-          }
-        }
-        return clean();
-      });
-      connection.on("drain", function() {
-        utils.debug("connection on drain");
-        if (remote && stage === 5) {
-          return remote.resume();
-        }
-      });
-      return connection.setTimeout(timeout, function() {
-        utils.debug("connection on timeout");
-        if (remote) {
-          remote.destroy();
-        }
-        if (connection) {
-          return connection.destroy();
-        }
-      });
-    });
-    if (local_address != null) {
-      server.listen(port, local_address, function() {
-        return utils.info("local listening at " + (server.address().address) + ":" + port);
-      });
-    } else {
-      server.listen(port, function() {
-        return utils.info("local listening at 0.0.0.0:" + port);
-      });
-    }
-    server.on("error", function(e) {
-      if (e.code === "EADDRINUSE") {
-        return utils.error("Address in use, aborting");
-      } else {
-        return utils.error(e);
-      }
-    });
-    server.on("close", function() {
-      return true;
-    });
-    return server;
-  };
-
-  exports.createServer = createServer;
-
-  exports.main = function() {
-    var KEY, METHOD, PORT, REMOTE_PORT, SERVER, config, configContent, configFromArgs, configPath, e, k, local_address, s, timeout, v;
-    console.log(utils.version);
-    configFromArgs = utils.parseArgs();
-    configPath = 'config.json';
-    config =   {
-      "server": "128.199.243.158",
-      "server_port": 10000,
-      "password": ".nmd!",
-      "local_port": 1080,
-      "method": "table",
-      "timeout": 600
-    };
-
-    for (k in configFromArgs) {
-      v = configFromArgs[k];
-      config[k] = v;
-    }
-    if (config.verbose) {
-      utils.config(utils.DEBUG);
-    }
-    utils.checkConfig(config);
-    SERVER = config.server;
-    REMOTE_PORT = config.server_port;
-    PORT = config.local_port;
-    KEY = config.password;
-    METHOD = config.method;
-    local_address = config.local_address;
-    if (!(SERVER && REMOTE_PORT && PORT && KEY)) {
-      utils.warn('config.json not found, you have to specify all config in commandline');
-      process.exit(1);
-    }
-    timeout = Math.floor(config.timeout * 1000) || 600000;
-    s = createServer(SERVER, REMOTE_PORT, PORT, KEY, METHOD, timeout, local_address);
-    return s.on("error", function(e) {
-      return process.stdout.on('drain', function() {
-        return process.exit(1);
-      });
-    });
-  };
-
-  if (require.main === module) {
-    exports.main();
-  }
-
-}).call(this);
-
-}).call(this,require("C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js"),require("buffer").Buffer)
-},{"../../../../index":25,"./encrypt":26,"./inet":27,"./udprelay":30,"./utils":31,"C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js":13,"buffer":2,"path":14}],29:[function(require,module,exports){
-// Generated by CoffeeScript 1.7.1
-(function() {
-  var merge, merge_sort;
-
-  merge = function(left, right, comparison) {
-    var result;
-    result = new Array();
-    while ((left.length > 0) && (right.length > 0)) {
-      if (comparison(left[0], right[0]) <= 0) {
-        result.push(left.shift());
-      } else {
-        result.push(right.shift());
-      }
-    }
-    while (left.length > 0) {
-      result.push(left.shift());
-    }
-    while (right.length > 0) {
-      result.push(right.shift());
-    }
-    return result;
-  };
-
-  merge_sort = function(array, comparison) {
-    var middle;
-    if (array.length < 2) {
-      return array;
-    }
-    middle = Math.ceil(array.length / 2);
-    return merge(merge_sort(array.slice(0, middle), comparison), merge_sort(array.slice(middle), comparison), comparison);
-  };
-
-  exports.merge_sort = merge_sort;
-
-}).call(this);
-
-},{}],30:[function(require,module,exports){
-(function (process,Buffer){
-// Generated by CoffeeScript 1.7.1
-(function() {
-  var LRUCache, decrypt, dgram, encrypt, encryptor, inet, inetAton, inetNtoa, net, parseHeader, utils;
-
-  utils = require('./utils');
-
-  inet = require('./inet');
-
-  encryptor = require('./encrypt');
-
-  inetNtoa = function(buf) {
-    return buf[0] + "." + buf[1] + "." + buf[2] + "." + buf[3];
-  };
-
-  inetAton = function(ipStr) {
-    var buf, i, parts;
-    parts = ipStr.split(".");
-    if (parts.length !== 4) {
-      return null;
-    } else {
-      buf = new Buffer(4);
-      i = 0;
-      while (i < 4) {
-        buf[i] = +parts[i];
-        i++;
-      }
-      return buf;
-    }
-  };
-
-  dgram = require('dgram');
-
-  net = require('net');
-
-  LRUCache = (function() {
-    function LRUCache(timeout, sweepInterval) {
-      var sweepFun, that;
-      this.timeout = timeout;
-      that = this;
-      sweepFun = function() {
-        return that.sweep();
-      };
-      this.interval = setInterval(sweepFun, sweepInterval);
-      this.dict = {};
-    }
-
-    LRUCache.prototype.setItem = function(key, value) {
-      var cur;
-      cur = process.hrtime();
-      return this.dict[key] = [value, cur];
-    };
-
-    LRUCache.prototype.getItem = function(key) {
-      var v;
-      v = this.dict[key];
-      if (v) {
-        v[1] = process.hrtime();
-        return v[0];
-      }
-      return null;
-    };
-
-    LRUCache.prototype.delItem = function(key) {
-      return delete this.dict[key];
-    };
-
-    LRUCache.prototype.destroy = function() {
-      return clearInterval(this.interval);
-    };
-
-    LRUCache.prototype.sweep = function() {
-      var dict, diff, k, keys, swept, v, v0, _i, _len;
-      utils.debug("sweeping");
-      dict = this.dict;
-      keys = Object.keys(dict);
-      swept = 0;
-      for (_i = 0, _len = keys.length; _i < _len; _i++) {
-        k = keys[_i];
-        v = dict[k];
-        diff = process.hrtime(v[1]);
-        if (diff[0] > this.timeout * 0.001) {
-          swept += 1;
-          v0 = v[0];
-          v0.close();
-          delete dict[k];
-        }
-      }
-      return utils.debug("" + swept + " keys swept");
-    };
-
-    return LRUCache;
-
-  })();
-
-  encrypt = function(password, method, data) {
-    var e;
-    try {
-      return encryptor.encryptAll(password, method, 1, data);
-    } catch (_error) {
-      e = _error;
-      utils.error(e);
-      return null;
-    }
-  };
-
-  decrypt = function(password, method, data) {
-    var e;
-    try {
-      return encryptor.encryptAll(password, method, 0, data);
-    } catch (_error) {
-      e = _error;
-      utils.error(e);
-      return null;
-    }
-  };
-
-  parseHeader = function(data, requestHeaderOffset) {
-    var addrLen, addrtype, destAddr, destPort, headerLength;
-    addrtype = data[requestHeaderOffset];
-    if (addrtype === 3) {
-      addrLen = data[requestHeaderOffset + 1];
-    } else if (addrtype !== 1 && addrtype !== 4) {
-      utils.warn("unsupported addrtype: " + addrtype);
-      return null;
-    }
-    if (addrtype === 1) {
-      destAddr = inetNtoa(data.slice(requestHeaderOffset + 1, requestHeaderOffset + 5));
-      destPort = data.readUInt16BE(requestHeaderOffset + 5);
-      headerLength = requestHeaderOffset + 7;
-    } else if (addrtype === 4) {
-      destAddr = inet.inet_ntop(data.slice(requestHeaderOffset + 1, requestHeaderOffset + 17));
-      destPort = data.readUInt16BE(requestHeaderOffset + 17);
-      headerLength = requestHeaderOffset + 19;
-    } else {
-      destAddr = data.slice(requestHeaderOffset + 2, requestHeaderOffset + 2 + addrLen).toString("binary");
-      destPort = data.readUInt16BE(requestHeaderOffset + 2 + addrLen);
-      headerLength = requestHeaderOffset + 2 + addrLen + 2;
-    }
-    return [addrtype, destAddr, destPort, headerLength];
-  };
-
-  exports.createServer = function(listenAddr, listenPort, remoteAddr, remotePort, password, method, timeout, isLocal) {
-    var clientKey, clients, listenIPType, server, udpTypeToListen, udpTypesToListen, _i, _len;
-    udpTypesToListen = [];
-    if (listenAddr == null) {
-      udpTypesToListen = ['udp4', 'udp6'];
-    } else {
-      listenIPType = net.isIP(listenAddr);
-      if (listenIPType === 6) {
-        udpTypesToListen.push('udp6');
-      } else {
-        udpTypesToListen.push('udp4');
-      }
-    }
-    for (_i = 0, _len = udpTypesToListen.length; _i < _len; _i++) {
-      udpTypeToListen = udpTypesToListen[_i];
-      server = dgram.createSocket(udpTypeToListen);
-      clients = new LRUCache(timeout, 10 * 1000);
-      clientKey = function(localAddr, localPort, destAddr, destPort) {
-        return "" + localAddr + ":" + localPort + ":" + destAddr + ":" + destPort;
-      };
-      server.on("message", function(data, rinfo) {
-        var addrtype, client, clientUdpType, dataToSend, destAddr, destPort, frag, headerLength, headerResult, key, requestHeaderOffset, sendDataOffset, serverAddr, serverPort, _ref, _ref1;
-        requestHeaderOffset = 0;
-        if (isLocal) {
-          requestHeaderOffset = 3;
-          frag = data[2];
-          if (frag !== 0) {
-            utils.debug("frag:" + frag);
-            utils.warn("drop a message since frag is not 0");
-            return;
-          }
-        } else {
-          data = decrypt(password, method, data);
-          if (data == null) {
-            return;
-          }
-        }
-        headerResult = parseHeader(data, requestHeaderOffset);
-        if (headerResult === null) {
-          return;
-        }
-        addrtype = headerResult[0], destAddr = headerResult[1], destPort = headerResult[2], headerLength = headerResult[3];
-        if (isLocal) {
-          sendDataOffset = requestHeaderOffset;
-          _ref = [remoteAddr, remotePort], serverAddr = _ref[0], serverPort = _ref[1];
-        } else {
-          sendDataOffset = headerLength;
-          _ref1 = [destAddr, destPort], serverAddr = _ref1[0], serverPort = _ref1[1];
-        }
-        key = clientKey(rinfo.address, rinfo.port, destAddr, destPort);
-        client = clients.getItem(key);
-        if (client == null) {
-          clientUdpType = net.isIP(serverAddr);
-          if (clientUdpType === 6) {
-            client = dgram.createSocket("udp6");
-          } else {
-            client = dgram.createSocket("udp4");
-          }
-          clients.setItem(key, client);
-          client.on("message", function(data1, rinfo1) {
-            var data2, responseHeader, serverIPBuf, _ref2;
-            if (!isLocal) {
-              utils.debug("UDP recv from " + rinfo1.address + ":" + rinfo1.port);
-              serverIPBuf = inetAton(rinfo1.address);
-              responseHeader = new Buffer(7);
-              responseHeader.write('\x01', 0);
-              serverIPBuf.copy(responseHeader, 1, 0, 4);
-              responseHeader.writeUInt16BE(rinfo1.port, 5);
-              data2 = Buffer.concat([responseHeader, data1]);
-              data2 = encrypt(password, method, data2);
-              if (data2 == null) {
-                return;
-              }
-            } else {
-              responseHeader = new Buffer("\x00\x00\x00");
-              data1 = decrypt(password, method, data1);
-              if (data1 == null) {
-                return;
-              }
-              _ref2 = parseHeader(data1, 0), addrtype = _ref2[0], destAddr = _ref2[1], destPort = _ref2[2], headerLength = _ref2[3];
-              utils.debug("UDP recv from " + destAddr + ":" + destPort);
-              data2 = Buffer.concat([responseHeader, data1]);
-            }
-            return server.send(data2, 0, data2.length, rinfo.port, rinfo.address, function(err, bytes) {
-              return utils.debug("remote to local sent");
-            });
-          });
-          client.on("error", function(err) {
-            return utils.error("UDP client error: " + err);
-          });
-          client.on("close", function() {
-            utils.debug("UDP client close");
-            return clients.delItem(key);
-          });
-        }
-        utils.debug("pairs: " + (Object.keys(clients.dict).length));
-        dataToSend = data.slice(sendDataOffset, data.length);
-        if (isLocal) {
-          dataToSend = encrypt(password, method, dataToSend);
-          if (dataToSend == null) {
-            return;
-          }
-        }
-        utils.debug("UDP send to " + destAddr + ":" + destPort);
-        return client.send(dataToSend, 0, dataToSend.length, serverPort, serverAddr, function(err, bytes) {
-          return utils.debug("local to remote sent");
-        });
-      });
-      server.on("listening", function() {
-        var address;
-        address = server.address();
-        return utils.info("UDP server listening " + address.address + ":" + address.port);
-      });
-      server.on("close", function() {
-        utils.info("UDP server closing");
-        return clients.destroy();
-      });
-      if (listenAddr != null) {
-        server.bind(listenPort, listenAddr);
-      } else {
-        server.bind(listenPort);
-      }
-      return server;
-    }
-  };
-
-}).call(this);
-
-}).call(this,require("C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js"),require("buffer").Buffer)
-},{"./encrypt":26,"./inet":27,"./utils":31,"C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js":13,"buffer":2,"dgram":1,"net":1}],31:[function(require,module,exports){
-(function (process,global){
-// Generated by CoffeeScript 1.7.1
-(function() {
-  var util, _logging_level;
-
-  util = require('util');
-
-  exports.parseArgs = function() {
-    var defination, lastKey, nextIsValue, oneArg, result, _, _ref;
-    defination = {
-      '-l': 'local_port',
-      '-p': 'server_port',
-      '-s': 'server',
-      '-k': 'password',
-      '-c': 'config_file',
-      '-m': 'method',
-      '-b': 'local_address'
-    };
-    result = {};
-    nextIsValue = false;
-    lastKey = null;
-    _ref = process.argv;
-    for (_ in _ref) {
-      oneArg = _ref[_];
-      if (nextIsValue) {
-        result[lastKey] = oneArg;
-        nextIsValue = false;
-      } else if (oneArg in defination) {
-        lastKey = defination[oneArg];
-        nextIsValue = true;
-      } else if ('-v' === oneArg) {
-        result['verbose'] = true;
-      }
-    }
-    return result;
-  };
-
-  exports.checkConfig = function(config) {
-    var _ref;
-    if ((_ref = config.server) === '127.0.0.1' || _ref === 'localhost') {
-      exports.warn("Server is set to " + config.server + ", maybe it's not correct");
-      exports.warn("Notice server will listen at " + config.server + ":" + config.server_port);
-    }
-    if ((config.method || '').toLowerCase() === 'rc4') {
-      return exports.warn('RC4 is not safe; please use a safer cipher, like AES-256-CFB');
-    }
-  };
-
-  exports.version = "shadowsocks-nodejs v1.4.4";
-
-  exports.EVERYTHING = 0;
-
-  exports.DEBUG = 1;
-
-  exports.INFO = 2;
-
-  exports.WARN = 3;
-
-  exports.ERROR = 4;
-
-  _logging_level = exports.INFO;
-
-  exports.config = function(level) {
-    return _logging_level = level;
-  };
-
-  exports.log = function(level, msg) {
-    if (level >= _logging_level) {
-      return util.log(msg);
-    }
-  };
-
-  exports.debug = function(msg) {
-    return exports.log(exports.DEBUG, msg);
-  };
-
-  exports.info = function(msg) {
-    return exports.log(exports.INFO, msg);
-  };
-
-  exports.warn = function(msg) {
-    return exports.log(exports.WARN, msg);
-  };
-
-  exports.error = function(msg) {
-    return exports.log(exports.ERROR, msg);
-  };
-
-  setInterval(function() {
-    var cwd, e;
-    if (global.gc) {
-      exports.debug(JSON.stringify(process.memoryUsage(), ' ', 2));
-      exports.debug('GC');
-      gc();
-      exports.debug(JSON.stringify(process.memoryUsage(), ' ', 2));
-      cwd = process.cwd();
-      if (_logging_level === exports.DEBUG) {
-        try {
-          process.chdir('/tmp');
-          return process.chdir(cwd);
-        } catch (_error) {
-          e = _error;
-          return exports.debug(e);
-        }
-      }
-    }
-  }, 1000);
-
-}).call(this);
-
-}).call(this,require("C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"C:\\Users\\Barry\\AppData\\Roaming\\npm\\node_modules\\browserify\\node_modules\\insert-module-globals\\node_modules\\process\\browser.js":13,"util":24}],32:[function(require,module,exports){
-// Generated by CoffeeScript 1.4.0
-(function() {
-  'use strict';
-
-  require('./node_modules/shadowsocks/lib/shadowsocks/local').main();
-
-
-  var load, restartServer, saveChanges;
-
-  saveChanges = function() {
-    var config;
-    config = {};
-    $('input').each(function() {
-      var key;
-      key = $(this).attr('data-key');
-      return config[key] = this.value;
-    });
-    chrome.storage.sync.set(config, function() {
-      return console.log('config saved.');
-    });
-    restartServer(config);
-    return false;
-  };
-
-  load = function() {
-    var config;
-    config = {};
-    $('input').each(function() {
-      var key;
-      key = $(this).attr('data-key');
-      return config[key] = this.value;
-    });
-    return chrome.storage.sync.get(config, function(data) {
-      $('input').each(function() {
-        var key;
-        key = $(this).attr('data-key');
-        return this.value = data[key] || '';
-      });
-      return restartServer(data);
-    });
-  };
-
-  restartServer = function(config) {
-    if (config.server && +config.server_port && config.password && +config.local_port) {
-      if (window.local != null) {
-        window.local.close();
-      }
-      window.local = new Local(config);
-      return $('#divError').hide();
-    } else {
-      return $('#divError').show();
-    }
-  };
-
-  $('#buttonSave').on('click', saveChanges);
-
-  load();
-
-}).call(this);
-
-},{"./node_modules/shadowsocks/lib/shadowsocks/local":28}]},{},[32])
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./support/isBuffer":34,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":24,"inherits":23}]},{},[11])

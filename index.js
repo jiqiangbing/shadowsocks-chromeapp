@@ -49,7 +49,7 @@ net.createServer = function() {
 
   var cb = args[args.length -1];
   cb = (typeof cb === 'function') ? cb : function() {};
-
+  console.info(cb);
   if(typeof args[0] === 'object') {
     options = args[0];
   }

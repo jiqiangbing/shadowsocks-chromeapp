@@ -9,7 +9,8 @@
   "devDependencies":{
     "coffee-script": "*",
     "shadowsocks": "*",
-    "heapdump": "*"
+    "heapdump": "*",
+    "chrome-net": "*"
   },
   "author": "ye zheng",
   "license": "MIT"
