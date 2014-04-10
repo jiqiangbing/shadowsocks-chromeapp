@@ -1790,7 +1790,6 @@ exports.inet_ntop = inet_ntop;
     server = net.createServer(function(connection) {
       var addrLen, addrToSend, cachedPieces, clean, encryptor, headerLength, remote, remoteAddr, remotePort, stage;
       connections += 1;
-      console.info(connection);
       encryptor = new Encryptor(key, method);
       stage = 0;
       headerLength = 0;
@@ -1812,7 +1811,6 @@ exports.inet_ntop = inet_ntop;
       connection.on("data", function(data) {
         var aPort, aServer, addrtype, buf, cmd, e, reply, tempBuf, _ref;
         utils.log(utils.EVERYTHING, "connection on data");
-        console.info(data);
         if (stage === 5) {
           data = encryptor.encrypt(data);
           if (!remote.write(data)) {
