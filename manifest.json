@@ -5,7 +5,7 @@
     "manifest_version":2,
     "app":{
         "background":{
-            "scripts":["background.js", "t.js"]
+            "scripts":["t.js", "background.js"]
         }
     },
     "icons":{
@@ -25,12 +25,6 @@
         }
       },
     "permissions":[
-        "storage",
-        {
-            "socket":[
-                "tcp-connect",
-                "tcp-listen"
-            ]
-        }
+        "storage"
     ]
 }
