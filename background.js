@@ -4,5 +4,3 @@ chrome.app.runtime.onLaunched.addListener(function() {
         'height': 350
     });
 });
-
-require('./node_modules/shadowsocks/lib/shadowsocks/local').main();
