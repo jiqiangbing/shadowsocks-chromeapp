@@ -9,7 +9,6 @@
   "devDependencies":{
     "coffee-script": "*",
     "shadowsocks": "*",
-    "heapdump": "*",
     "chrome-net": "*"
   },
   "author": "ye zheng",
