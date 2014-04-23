@@ -6,11 +6,35 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "devDependencies":{
+  "devDependencies": {
     "coffee-script": "*",
     "shadowsocks": "*",
-    "chrome-net": "*"
+    "chrome-net": "*",
+    "chrome-dgram": "*",
+    "grunt": "*"
   },
   "author": "ye zheng",
-  "license": "MIT"
+  "license": "MIT",
+  "jshint_options": {
+    "bitwise": false,
+    "camelcase": true,
+    "curly": true,
+    "eqeqeq": true,
+    "indent": 2,
+    "plusplus": true,
+    "undef": true,
+    "unused": true,
+    "trailing": true,
+
+    "eqnull": true,
+    "evil": true,
+    "expr": true,
+    "laxcomma": true,
+
+    "browser": true,
+    "jquery": true,
+    "node": true,
+    "wsh": true,
+    "predef": [ "chrome" ]
+  }
 }

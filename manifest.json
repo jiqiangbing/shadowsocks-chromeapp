@@ -5,12 +5,12 @@
     "manifest_version":2,
     "app":{
         "background":{
-            "scripts":["background.js", "t.js", "main.js"]
+            "scripts":["src/background.js", "src/shadowsocks.js", "src/main.js"]
         }
     },
     "icons":{
-        "16":"icon-16.png",
-        "128":"icon-128.png"
+        "16":"resource/icon-16.png",
+        "128":"resource/icon-128.png"
     },
     "sockets": {
         "udp": {
