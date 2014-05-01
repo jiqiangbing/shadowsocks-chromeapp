@@ -1,6 +1,400 @@
-(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-require('./node_modules/shadowsocks/lib/shadowsocks/local').main();
-},{"./node_modules/shadowsocks/lib/shadowsocks/local":9}],2:[function(require,module,exports){
+require=(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({"zwqi3x":[function(require,module,exports){
+(function (Buffer){
+/**
+ * UDP / Datagram Sockets
+ * ======================
+ *
+ * Datagram sockets are available through require('chrome-dgram').
+ */
+
+exports.Socket = Socket
+
+var EventEmitter = require('events').EventEmitter
+var util = require('util')
+
+var BIND_STATE_UNBOUND = 0
+var BIND_STATE_BINDING = 1
+var BIND_STATE_BOUND = 2
+
+// Track open sockets to route incoming data (via onReceive) to the right handlers.
+var sockets = {}
+
+if (typeof chrome !== 'undefined') {
+  chrome.sockets.udp.onReceive.addListener(onReceive)
+  chrome.sockets.udp.onReceiveError.addListener(onReceiveError)
+}
+
+function onReceive (info) {
+  if (info.socketId in sockets) {
+    sockets[info.socketId]._onReceive(info)
+  } else {
+    console.error('Unknown socket id: ' + info.socketId)
+  }
+}
+
+function onReceiveError (info) {
+  if (info.socketId in sockets) {
+    sockets[info.socketId]._onReceiveError(info.resultCode)
+  } else {
+    console.error('Unknown socket id: ' + info.socketId)
+  }
+}
+
+/**
+ * dgram.createSocket(type, [callback])
+ *
+ * Creates a datagram Socket of the specified types. Valid types are `udp4`
+ * and `udp6`.
+ *
+ * Takes an optional callback which is added as a listener for message events.
+ *
+ * Call socket.bind if you want to receive datagrams. socket.bind() will bind
+ * to the "all interfaces" address on a random port (it does the right thing
+ * for both udp4 and udp6 sockets). You can then retrieve the address and port
+ * with socket.address().address and socket.address().port.
+ *
+ * @param  {string} type       Either 'udp4' or 'udp6'
+ * @param  {function} listener Attached as a listener to message events.
+ *                             Optional
+ * @return {Socket}            Socket object
+ */
+exports.createSocket = function (type, listener) {
+  return new Socket(type, listener)
+}
+
+util.inherits(Socket, EventEmitter)
+
+/**
+ * Class: dgram.Socket
+ *
+ * The dgram Socket class encapsulates the datagram functionality. It should
+ * be created via `dgram.createSocket(type, [callback])`.
+ *
+ * Event: 'message'
+ *   - msg Buffer object. The message
+ *   - rinfo Object. Remote address information
+ *   Emitted when a new datagram is available on a socket. msg is a Buffer and
+ *   rinfo is an object with the sender's address information and the number
+ *   of bytes in the datagram.
+ *
+ * Event: 'listening'
+ *   Emitted when a socket starts listening for datagrams. This happens as soon
+ *   as UDP sockets are created.
+ *
+ * Event: 'close'
+ *   Emitted when a socket is closed with close(). No new message events will
+ *   be emitted on this socket.
+ *
+ * Event: 'error'
+ *   - exception Error object
+ *   Emitted when an error occurs.
+ */
+function Socket (type, listener) {
+  var self = this
+  EventEmitter.call(self)
+
+  if (type !== 'udp4')
+    throw new Error('Bad socket type specified. Valid types are: udp4')
+
+  if (typeof listener === 'function')
+    self.on('message', listener)
+
+  self._destroyed = false
+  self._bindState = BIND_STATE_UNBOUND
+}
+
+/**
+ * socket.bind(port, [address], [callback])
+ *
+ * For UDP sockets, listen for datagrams on a named port and optional address.
+ * If address is not specified, the OS will try to listen on all addresses.
+ * After binding is done, a "listening" event is emitted and the callback(if
+ * specified) is called. Specifying both a "listening" event listener and
+ * callback is not harmful but not very useful.
+ *
+ * A bound datagram socket keeps the node process running to receive
+ * datagrams.
+ *
+ * If binding fails, an "error" event is generated. In rare case (e.g. binding
+ * a closed socket), an Error may be thrown by this method.
+ *
+ * @param {number} port
+ * @param {string} address Optional
+ * @param {function} callback Function with no parameters, Optional. Callback
+ *                            when binding is done.
+ */
+Socket.prototype.bind = function (port, address, callback) {
+  var self = this
+  if (typeof address === 'function') {
+    callback = address
+    address = undefined
+  }
+
+  if (!address)
+    address = '0.0.0.0'
+
+  if (self._bindState !== BIND_STATE_UNBOUND)
+    throw new Error('Socket is already bound')
+
+  self._bindState = BIND_STATE_BINDING
+
+  if (typeof callback === 'function')
+    self.once('listening', callback)
+
+  chrome.sockets.udp.create(function (createInfo) {
+    self.id = createInfo.socketId
+
+    sockets[self.id] = self
+    chrome.sockets.udp.bind(self.id, address, port, function (result) {
+      if (result < 0) {
+        self.emit('error', new Error('Socket ' + self.id + ' failed to bind. ' +
+          chrome.runtime.lastError.message))
+        return
+      }
+      chrome.sockets.udp.getInfo(self.id, function (socketInfo) {
+        if (!socketInfo.localPort || !socketInfo.localAddress) {
+          self.emit(new Error('Cannot get local port/address for Socket ' + self.id))
+          return
+        }
+
+        self._port = socketInfo.localPort
+        self._address = socketInfo.localAddress
+
+        self._bindState = BIND_STATE_BOUND
+        self.emit('listening')
+      })
+    })
+  })
+}
+
+/**
+ * Internal function to receive new messages and emit `message` events.
+ */
+Socket.prototype._onReceive = function (info) {
+  var self = this
+
+  var buf = new Buffer(new Uint8Array(info.data))
+  var rinfo = {
+    address: info.remoteAddress,
+    family: 'IPv4',
+    port: info.remotePort,
+    size: buf.length
+  }
+  self.emit('message', buf, rinfo)
+}
+
+Socket.prototype._onReceiveError = function (resultCode) {
+  var self = this
+  self.emit('error', new Error('Socket ' + self.id + ' receive error ' + resultCode))
+}
+
+/**
+ * socket.send(buf, offset, length, port, address, [callback])
+ *
+ * For UDP sockets, the destination port and IP address must be
+ * specified. A string may be supplied for the address parameter, and it will
+ * be resolved with DNS. An optional callback may be specified to detect any
+ * DNS errors and when buf may be re-used. Note that DNS lookups will delay
+ * the time that a send takes place, at least until the next tick. The only
+ * way to know for sure that a send has taken place is to use the callback.
+ *
+ * If the socket has not been previously bound with a call to bind, it's
+ * assigned a random port number and bound to the "all interfaces" address
+ * (0.0.0.0 for udp4 sockets, ::0 for udp6 sockets).
+ *
+ * @param {Buffer|Arrayish|string} buf Message to be sent
+ * @param {number} offset Offset in the buffer where the message starts.
+ * @param {number} length Number of bytes in the message.
+ * @param {number} port destination port
+ * @param {string} address destination IP
+ * @param {function} callback Callback when message is done being delivered.
+ *                            Optional.
+ */
+// Socket.prototype.send = function (buf, host, port, cb) {
+Socket.prototype.send = function (buffer, offset, length, port, address, callback) {
+  var self = this
+  if (!callback) callback = function () {}
+
+  if (offset !== 0)
+    throw new Error('Non-zero offset not supported yet')
+
+  if (self._bindState === BIND_STATE_UNBOUND)
+    self.bind(0)
+
+  // If the socket hasn't been bound yet, push the outbound packet onto the
+  // send queue and send after binding is complete.
+  if (self._bindState !== BIND_STATE_BOUND) {
+    // If the send queue hasn't been initialized yet, do it, and install an
+    // event handler that flishes the send queue after binding is done.
+    if (!self._sendQueue) {
+      self._sendQueue = []
+      self.once('listening', function () {
+        // Flush the send queue.
+        for (var i = 0; i < self._sendQueue.length; i++) {
+          self.send.apply(self, self._sendQueue[i])
+        }
+        self._sendQueue = undefined
+      })
+    }
+    self._sendQueue.push([buffer, offset, length, port, address, callback])
+    return
+  }
+
+  if (!Buffer.isBuffer(buffer)) buffer = new Buffer(buffer)
+  // assuming buffer is browser implementation (`buffer` package on npm)
+  chrome.sockets.udp.send(self.id, buffer.buffer /* buffer.toArrayBuffer() is slower */,
+                      address, port, function (sendInfo) {
+    if (sendInfo.resultCode < 0) {
+      var err = new Error('Socket ' + self.id + ' send error ' + sendInfo.resultCode)
+      callback(err)
+      self.emit('error', err)
+    } else {
+      callback(null)
+    }
+  })
+}
+
+/**
+ * Close the underlying socket and stop listening for data on it.
+ */
+Socket.prototype.close = function () {
+  var self = this
+  if (self._destroyed)
+    return
+
+  delete sockets[self.id]
+  chrome.sockets.udp.close(self.id)
+  self._destroyed = true
+
+  self.emit('close')
+}
+
+/**
+ * Returns an object containing the address information for a socket. For UDP
+ * sockets, this object will contain address, family and port.
+ *
+ * @return {Object} information
+ */
+Socket.prototype.address = function () {
+  var self = this
+  return {
+    address: self._address,
+    port: self._port,
+    family: 'IPv4'
+  }
+}
+
+Socket.prototype.setBroadcast = function (flag) {
+  // No chrome.sockets equivalent
+}
+
+Socket.prototype.setTTL = function (ttl) {
+  // No chrome.sockets equivalent
+}
+
+// NOTE: Multicast code is untested. Pull requests accepted for bug fixes and to
+// add tests!
+
+/**
+ * Sets the IP_MULTICAST_TTL socket option. TTL stands for "Time to Live," but
+ * in this context it specifies the number of IP hops that a packet is allowed
+ * to go through, specifically for multicast traffic. Each router or gateway
+ * that forwards a packet decrements the TTL. If the TTL is decremented to 0
+ * by a router, it will not be forwarded.
+ *
+ * The argument to setMulticastTTL() is a number of hops between 0 and 255.
+ * The default on most systems is 1.
+ *
+ * NOTE: The Chrome version of this function is async, whereas the node
+ * version is sync. Keep this in mind.
+ *
+ * @param {number} ttl
+ * @param {function} callback CHROME-SPECIFIC: Called when the configuration
+ *                            operation is done.
+ */
+Socket.prototype.setMulticastTTL = function (ttl, callback) {
+  var self = this
+  if (!callback) callback = function () {}
+  chrome.sockets.udp.setMulticastTimeToLive(self.id, ttl, callback)
+}
+
+/**
+ * Sets or clears the IP_MULTICAST_LOOP socket option. When this option is
+ * set, multicast packets will also be received on the local interface.
+ *
+ * NOTE: The Chrome version of this function is async, whereas the node
+ * version is sync. Keep this in mind.
+ *
+ * @param {boolean} flag
+ * @param {function} callback CHROME-SPECIFIC: Called when the configuration
+ *                            operation is done.
+ */
+Socket.prototype.setMulticastLoopback = function (flag, callback) {
+  var self = this
+  if (!callback) callback = function () {}
+  chrome.sockets.udp.setMulticastLoopbackMode(self.id, flag, callback)
+}
+
+/**
+ * Tells the kernel to join a multicast group with IP_ADD_MEMBERSHIP socket
+ * option.
+ *
+ * If multicastInterface is not specified, the OS will try to add membership
+ * to all valid interfaces.
+ *
+ * NOTE: The Chrome version of this function is async, whereas the node
+ * version is sync. Keep this in mind.
+ *
+ * @param {string} multicastAddress
+ * @param {string} [multicastInterface] Optional
+ * @param {function} callback CHROME-SPECIFIC: Called when the configuration
+ *                            operation is done.
+ */
+Socket.prototype.addMembership = function (multicastAddress,
+                                           multicastInterface,
+                                           callback) {
+  var self = this
+  if (!callback) callback = function () {}
+  chrome.sockets.udp.joinGroup(self.id, multicastAddress, callback)
+}
+
+/**
+ * Opposite of addMembership - tells the kernel to leave a multicast group
+ * with IP_DROP_MEMBERSHIP socket option. This is automatically called by the
+ * kernel when the socket is closed or process terminates, so most apps will
+ * never need to call this.
+ *
+ * NOTE: The Chrome version of this function is async, whereas the node
+ * version is sync. Keep this in mind.
+ *
+ * If multicastInterface is not specified, the OS will try to drop membership
+ * to all valid interfaces.
+ *
+ * @param  {[type]} multicastAddress
+ * @param  {[type]} multicastInterface Optional
+ * @param {function} callback CHROME-SPECIFIC: Called when the configuration
+ *                            operation is done.
+ */
+Socket.prototype.dropMembership = function (multicastAddress,
+                                            multicastInterface,
+                                            callback) {
+  var self = this
+  if (!callback) callback = function () {}
+  chrome.sockets.udp.leaveGroup(self.id, multicastAddress, callback)
+}
+
+Socket.prototype.unref = function () {
+  // No chrome.sockets equivalent
+}
+
+Socket.prototype.ref = function () {
+  // No chrome.sockets equivalent
+}
+
+}).call(this,require("buffer").Buffer)
+},{"buffer":17,"events":26,"util":39}],"dgram":[function(require,module,exports){
+module.exports=require('zwqi3x');
+},{}],"VIx7MN":[function(require,module,exports){
 (function (process,Buffer){
 /**
  * net
@@ -842,7 +1236,9 @@ function toNumber (x) {
 }
 
 }).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
-},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25,"buffer":14,"core-util-is":3,"events":23,"inherits":4,"ipaddr.js":5,"stream":28}],3:[function(require,module,exports){
+},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28,"buffer":17,"core-util-is":5,"events":26,"inherits":6,"ipaddr.js":7,"stream":31}],"net":[function(require,module,exports){
+module.exports=require('VIx7MN');
+},{}],5:[function(require,module,exports){
 (function (Buffer){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -952,7 +1348,7 @@ function objectToString(o) {
   return Object.prototype.toString.call(o);
 }
 }).call(this,require("buffer").Buffer)
-},{"buffer":14}],4:[function(require,module,exports){
+},{"buffer":17}],6:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -977,7 +1373,7 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],5:[function(require,module,exports){
+},{}],7:[function(require,module,exports){
 (function() {
   var expandIPv6, ipaddr, ipv4Part, ipv4Regexes, ipv6Part, ipv6Regexes, matchCIDR, root;
 
@@ -1380,34 +1776,11 @@ if (typeof Object.create === 'function') {
 
 }).call(this);
 
-},{}],6:[function(require,module,exports){
+},{}],8:[function(require,module,exports){
 
-},{}],7:[function(require,module,exports){
+},{}],9:[function(require,module,exports){
 (function (Buffer){
 // Generated by CoffeeScript 1.7.1
-
-/*
-  Copyright (c) 2014 clowwindy
-  
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-  
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-  
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
- */
-
 (function() {
   var EVP_BytesToKey, Encryptor, bytes_to_key_results, cachedTables, crypto, encryptAll, getTable, int32Max, merge_sort, method_supported, substitute, to_buffer, util;
 
@@ -1646,7 +2019,7 @@ if (typeof Object.create === 'function') {
 }).call(this);
 
 }).call(this,require("buffer").Buffer)
-},{"./merge_sort":10,"buffer":14,"crypto":18,"util":36}],8:[function(require,module,exports){
+},{"./merge_sort":13,"buffer":17,"crypto":21,"util":39}],10:[function(require,module,exports){
 // The functions in source file is from phpjs
 // https://github.com/kvz/phpjs
 // See license below
@@ -1751,36 +2124,13 @@ function inet_ntop (a) {
 exports.inet_pton = inet_pton;
 exports.inet_ntop = inet_ntop;
 
-},{}],9:[function(require,module,exports){
+},{}],"5qXmHi":[function(require,module,exports){
 (function (process,Buffer,__dirname){
 // Generated by CoffeeScript 1.7.1
-
-/*
-  Copyright (c) 2014 clowwindy
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
- */
-
 (function() {
   var Encryptor, connections, createServer, fs, inet, inetAton, inetNtoa, net, path, udpRelay, utils;
 
-  net = require("chrome-net");
+  net = require("net");
 
   fs = require("fs");
 
@@ -2166,32 +2516,11 @@ exports.inet_ntop = inet_ntop;
 
 }).call(this);
 
-}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer,"/node_modules/shadowsocks/lib/shadowsocks")
-},{"./encrypt":7,"./inet":8,"./udprelay":11,"./utils":12,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25,"buffer":14,"chrome-net":2,"fs":13,"path":26}],10:[function(require,module,exports){
+}).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer,"/shadowsocks/lib/shadowsocks")
+},{"./encrypt":9,"./inet":10,"./udprelay":14,"./utils":15,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28,"buffer":17,"fs":16,"net":"VIx7MN","path":29}],"shadowsocks":[function(require,module,exports){
+module.exports=require('5qXmHi');
+},{}],13:[function(require,module,exports){
 // Generated by CoffeeScript 1.7.1
-
-/*
-  Copyright (c) 2014 clowwindy
-  
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-  
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-  
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
- */
-
 (function() {
   var merge, merge_sort;
 
@@ -2227,32 +2556,9 @@ exports.inet_ntop = inet_ntop;
 
 }).call(this);
 
-},{}],11:[function(require,module,exports){
+},{}],14:[function(require,module,exports){
 (function (process,Buffer){
 // Generated by CoffeeScript 1.7.1
-
-/*
-  Copyright (c) 2014 clowwindy
-  
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-  
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-  
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
- */
-
 (function() {
   var LRUCache, decrypt, dgram, encrypt, encryptor, inet, inetAton, inetNtoa, net, parseHeader, utils;
 
@@ -2522,50 +2828,16 @@ exports.inet_ntop = inet_ntop;
 }).call(this);
 
 }).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
-},{"./encrypt":7,"./inet":8,"./utils":12,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25,"buffer":14,"dgram":13,"net":13}],12:[function(require,module,exports){
+},{"./encrypt":9,"./inet":10,"./utils":15,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28,"buffer":17,"dgram":"zwqi3x","net":"VIx7MN"}],15:[function(require,module,exports){
 (function (process,global){
 // Generated by CoffeeScript 1.7.1
-
-/*
-  Copyright (c) 2014 clowwindy
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
- */
-
 (function() {
-  var printLocalHelp, printServerHelp, util, _logging_level;
+  var util, _logging_level;
 
   util = require('util');
 
-  printLocalHelp = function() {
-    return console.log("usage: sslocal [-h] -s SERVER_ADDR -p SERVER_PORT [-b LOCAL_ADDR] -l LOCAL_PORT -k PASSWORD -m METHOD [-c config]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  -s SERVER_ADDR        server address\n  -p SERVER_PORT        server port\n  -b LOCAL_ADDR         local binding address, default is 127.0.0.1\n  -l LOCAL_PORT         local port\n  -k PASSWORD           password\n  -s METHOD             encryption method, for example, aes-256-cfb\n  -c CONFIG             path to config file");
-  };
-
-  printServerHelp = function() {
-    return console.log("usage: ssserver [-h] -s SERVER_ADDR -p SERVER_PORT -k PASSWORD -m METHOD [-c config]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  -s SERVER_ADDR        server address\n  -p SERVER_PORT        server port\n  -k PASSWORD           password\n  -s METHOD             encryption method, for example, aes-256-cfb\n  -c CONFIG             path to config file");
-  };
-
-  exports.parseArgs = function(isServer) {
+  exports.parseArgs = function() {
     var defination, lastKey, nextIsValue, oneArg, result, _, _ref;
-    if (isServer == null) {
-      isServer = false;
-    }
     defination = {
       '-l': 'local_port',
       '-p': 'server_port',
@@ -2589,13 +2861,6 @@ exports.inet_ntop = inet_ntop;
         nextIsValue = true;
       } else if ('-v' === oneArg) {
         result['verbose'] = true;
-      } else if (oneArg.indexOf('-') === 0) {
-        if (isServer) {
-          printServerHelp();
-        } else {
-          printLocalHelp();
-        }
-        process.exit(2);
       }
     }
     return result;
@@ -2612,7 +2877,7 @@ exports.inet_ntop = inet_ntop;
     }
   };
 
-  exports.version = "shadowsocks-nodejs v1.4.5";
+  exports.version = "shadowsocks-nodejs v1.4.4";
 
   exports.EVERYTHING = 0;
 
@@ -2676,9 +2941,9 @@ exports.inet_ntop = inet_ntop;
 }).call(this);
 
 }).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25,"heapdump":6,"util":36}],13:[function(require,module,exports){
-module.exports=require(6)
-},{}],14:[function(require,module,exports){
+},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28,"heapdump":8,"util":39}],16:[function(require,module,exports){
+module.exports=require(8)
+},{}],17:[function(require,module,exports){
 /**
  * The buffer module from node.js, for the browser.
  *
@@ -3790,7 +4055,7 @@ function assert (test, message) {
   if (!test) throw new Error(message || 'Failed assertion')
 }
 
-},{"base64-js":15,"ieee754":16}],15:[function(require,module,exports){
+},{"base64-js":18,"ieee754":19}],18:[function(require,module,exports){
 var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 ;(function (exports) {
@@ -3913,7 +4178,7 @@ var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 	module.exports.fromByteArray = uint8ToBase64
 }())
 
-},{}],16:[function(require,module,exports){
+},{}],19:[function(require,module,exports){
 exports.read = function(buffer, offset, isLE, mLen, nBytes) {
   var e, m,
       eLen = nBytes * 8 - mLen - 1,
@@ -3999,7 +4264,7 @@ exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128;
 };
 
-},{}],17:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 var Buffer = require('buffer').Buffer;
 var intSize = 4;
 var zeroBuffer = new Buffer(intSize); zeroBuffer.fill(0);
@@ -4036,7 +4301,7 @@ function hash(buf, fn, hashSize, bigEndian) {
 
 module.exports = { hash: hash };
 
-},{"buffer":14}],18:[function(require,module,exports){
+},{"buffer":17}],21:[function(require,module,exports){
 var Buffer = require('buffer').Buffer
 var sha = require('./sha')
 var sha256 = require('./sha256')
@@ -4135,7 +4400,7 @@ each(['createCredentials'
   }
 })
 
-},{"./md5":19,"./rng":20,"./sha":21,"./sha256":22,"buffer":14}],19:[function(require,module,exports){
+},{"./md5":22,"./rng":23,"./sha":24,"./sha256":25,"buffer":17}],22:[function(require,module,exports){
 /*
  * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
  * Digest Algorithm, as defined in RFC 1321.
@@ -4300,7 +4565,7 @@ module.exports = function md5(buf) {
   return helpers.hash(buf, core_md5, 16);
 };
 
-},{"./helpers":17}],20:[function(require,module,exports){
+},{"./helpers":20}],23:[function(require,module,exports){
 // Original code adapted from Robert Kieffer.
 // details at https://github.com/broofa/node-uuid
 (function() {
@@ -4333,7 +4598,7 @@ module.exports = function md5(buf) {
 
 }())
 
-},{}],21:[function(require,module,exports){
+},{}],24:[function(require,module,exports){
 /*
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-1, as defined
  * in FIPS PUB 180-1
@@ -4436,7 +4701,7 @@ module.exports = function sha1(buf) {
   return helpers.hash(buf, core_sha1, 20, true);
 };
 
-},{"./helpers":17}],22:[function(require,module,exports){
+},{"./helpers":20}],25:[function(require,module,exports){
 
 /**
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
@@ -4517,7 +4782,7 @@ module.exports = function sha256(buf) {
   return helpers.hash(buf, core_sha256, 32, true);
 };
 
-},{"./helpers":17}],23:[function(require,module,exports){
+},{"./helpers":20}],26:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -4819,9 +5084,9 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],24:[function(require,module,exports){
-module.exports=require(4)
-},{}],25:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
+module.exports=require(6)
+},{}],28:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -4883,7 +5148,7 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],26:[function(require,module,exports){
+},{}],29:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -5111,7 +5376,7 @@ var substr = 'ab'.substr(-1) === 'b'
 ;
 
 }).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25}],27:[function(require,module,exports){
+},{"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28}],30:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -5185,7 +5450,7 @@ function onend() {
   });
 }
 
-},{"./readable.js":31,"./writable.js":33,"inherits":24,"process/browser.js":29}],28:[function(require,module,exports){
+},{"./readable.js":34,"./writable.js":36,"inherits":27,"process/browser.js":32}],31:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -5314,7 +5579,7 @@ Stream.prototype.pipe = function(dest, options) {
   return dest;
 };
 
-},{"./duplex.js":27,"./passthrough.js":30,"./readable.js":31,"./transform.js":32,"./writable.js":33,"events":23,"inherits":24}],29:[function(require,module,exports){
+},{"./duplex.js":30,"./passthrough.js":33,"./readable.js":34,"./transform.js":35,"./writable.js":36,"events":26,"inherits":27}],32:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -5369,7 +5634,7 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],30:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -5412,7 +5677,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./transform.js":32,"inherits":24}],31:[function(require,module,exports){
+},{"./transform.js":35,"inherits":27}],34:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -6349,7 +6614,7 @@ function indexOf (xs, x) {
 }
 
 }).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./index.js":28,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25,"buffer":14,"events":23,"inherits":24,"process/browser.js":29,"string_decoder":34}],32:[function(require,module,exports){
+},{"./index.js":31,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28,"buffer":17,"events":26,"inherits":27,"process/browser.js":32,"string_decoder":37}],35:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -6555,7 +6820,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./duplex.js":27,"inherits":24}],33:[function(require,module,exports){
+},{"./duplex.js":30,"inherits":27}],36:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -6943,7 +7208,7 @@ function endWritable(stream, state, cb) {
   state.ended = true;
 }
 
-},{"./index.js":28,"buffer":14,"inherits":24,"process/browser.js":29}],34:[function(require,module,exports){
+},{"./index.js":31,"buffer":17,"inherits":27,"process/browser.js":32}],37:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7136,14 +7401,14 @@ function base64DetectIncompleteChar(buffer) {
   return incomplete;
 }
 
-},{"buffer":14}],35:[function(require,module,exports){
+},{"buffer":17}],38:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],36:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -7733,4 +7998,4 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,require("/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":35,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":25,"inherits":24}]},{},[1])
+},{"./support/isBuffer":38,"/usr/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":28,"inherits":27}]},{},[])

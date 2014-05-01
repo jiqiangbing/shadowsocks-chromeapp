@@ -8,7 +8,7 @@
   },
   "devDependencies": {
     "coffee-script": "*",
-    "shadowsocks": "*",
+    "shadowsocks": "1.4.4",
     "chrome-net": "*",
     "chrome-dgram": "*",
     "grunt": "*"
